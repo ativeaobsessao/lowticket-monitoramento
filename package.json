@@ -1,6 +1,6 @@
 {
   "name": "viva-labs-scraper",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Meta Ads Library Monitor — VIVA Labs",
   "type": "module",
   "main": "src/index.js",
