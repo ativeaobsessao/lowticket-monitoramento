@@ -1,20 +1,16 @@
 {
-  "name": "viva-labs-scraper",
-  "version": "1.0.2",
-  "description": "Meta Ads Library Monitor — VIVA Labs",
+  "name": "viva-labs",
+  "version": "2.0.0",
   "type": "module",
-  "main": "src/index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
-  },
-  "engines": {
-    "node": ">=18"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "pg": "^8.12.0",
+    "node-cron": "^3.0.3",
+    "pg": "^8.11.5",
     "playwright": "^1.44.0"
   }
 }
