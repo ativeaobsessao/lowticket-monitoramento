@@ -344,6 +344,37 @@ app.get("/dashboard", async (_req, res) => {
 
     const dados = JSON.stringify({ pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon });
 
+    // ── Tabela histórica: todas as coletas agrupadas por biblioteca + data + slot ──
+    // Busca os últimos 60 dias de histórico pra não sobrecarregar
+    const { rows: histAll } = await query(`
+      SELECT p.nome, sh.ads_count, sh.collected_at
+      FROM scrape_history sh
+      JOIN pages p ON p.slug = sh.slug
+      WHERE sh.collected_at >= NOW() - INTERVAL '60 days'
+      ORDER BY sh.collected_at DESC
+    `);
+
+    // Monta estrutura: { nome -> { 'YYYY-MM-DD' -> { 3: val, 12: val, 22: val } } }
+    const histMap = {};
+    for (const r of histAll) {
+      const nome = r.nome;
+      const dk = r.collected_at.toISOString().slice(0, 10);
+      const hour = r.collected_at.getHours();
+      const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
+      if (!histMap[nome]) histMap[nome] = {};
+      if (!histMap[nome][dk]) histMap[nome][dk] = {};
+      if (histMap[nome][dk][slot] === undefined) histMap[nome][dk][slot] = r.ads_count;
+    }
+
+    // Lista de datas únicas ordenadas desc (mais recente primeiro)
+    const histDates = [...new Set(histAll.map(r => r.collected_at.toISOString().slice(0, 10)))]
+      .sort((a, b) => b.localeCompare(a));
+
+    // Lista de bibliotecas ordenadas por ads desc (mesmo ordem do resumo)
+    const histLibs = Object.keys(paginas).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
+
+    const histDados = JSON.stringify({ map: histMap, dates: histDates, libs: histLibs });
+
     res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -403,6 +434,68 @@ tbody tr:hover td{background:var(--surface2)}
 .scalebar{height:5px;border-radius:3px;display:block}
 .spark3{font-family:'Space Mono',monospace;font-size:13px}
 @media(max-width:1100px){.grid-charts{grid-template-columns:1fr}.rosca-wrap{flex-direction:column}}
+
+/* ── Tabela histórica ── */
+.hist-tbl thead th{white-space:nowrap}
+.hist-tbl td{font-family:'Space Mono',monospace;font-size:12px;text-align:center}
+.hist-tbl td.lib-name{text-align:left;font-family:'Space Grotesk',sans-serif;font-weight:600;color:#fff;white-space:nowrap}
+.hist-tbl td.date-col{color:var(--muted);text-align:left;white-space:nowrap}
+.hist-slot{display:inline-block;min-width:42px;text-align:right}
+.hist-slot.empty{color:var(--border)}
+.tbl-scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch}
+
+/* ── Mobile responsivo ── */
+@media(max-width:768px){
+  body{padding:12px}
+  .hdr{flex-wrap:wrap;gap:8px}
+  .hdr-live{margin-left:0;width:100%}
+  .hdr h1{font-size:15px}
+  .hdr-logo{height:32px}
+  .hdr-sub{font-size:10px}
+  .scaling-strip{grid-template-columns:1fr 1fr}
+  .scale-card-val{font-size:24px}
+  .grid-charts{grid-template-columns:1fr}
+  .rosca-wrap{flex-direction:column;align-items:flex-start}
+  .rosca-canvas{width:120px;height:120px}
+  .hist-box{height:220px}
+
+  /* Tabela resumo → cards empilhados no mobile */
+  .tbl-panel table thead{display:none}
+  .tbl-panel table tbody tr{
+    display:block;
+    background:var(--surface2);
+    border:1px solid var(--border);
+    border-radius:10px;
+    margin-bottom:10px;
+    padding:12px 14px;
+  }
+  .tbl-panel table tbody td{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:5px 0;
+    border-top:none;
+    white-space:normal;
+    font-size:12px;
+  }
+  .tbl-panel table tbody td::before{
+    content:attr(data-label);
+    font-size:10px;
+    font-weight:600;
+    color:var(--muted);
+    text-transform:uppercase;
+    letter-spacing:.5px;
+    margin-right:10px;
+    flex-shrink:0;
+  }
+  .tbl-panel table tbody td.t-name{font-size:14px;font-weight:700;color:#fff;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px}
+  .tbl-panel table tbody td.t-name::before{display:none}
+  .scalebar-bg{width:50px}
+}
+
+@media(max-width:480px){
+  .scaling-strip{grid-template-columns:1fr}
+}
 </style>
 </head>
 <body>
@@ -443,6 +536,11 @@ tbody tr:hover td{background:var(--surface2)}
     </tr></thead>
     <tbody id="tbody"></tbody>
   </table>
+</div>
+
+<div class="section-label" style="margin-top:26px">📅 Histórico de coletas — por biblioteca · 03h · 12h · 22h</div>
+<div class="tbl-panel" id="hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
+  Carregando histórico...
 </div>
 
 <script>
@@ -518,15 +616,15 @@ porAds.forEach((pag,idx)=>{
   const partPct=Math.round((x.at/maxAds)*100);
   const corLib=COR[idx%COR.length];
   const tr=document.createElement("tr");
-  tr.innerHTML='<td class="mono" style="color:var(--muted)">'+(idx+1)+'</td>'
+  tr.innerHTML='<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
     +'<td class="t-name">'+pag+'</td>'
-    +'<td style="color:var(--muted)">'+did+'</td>'
-    +'<td class="mono">'+x.ini+'</td>'
-    +'<td class="mono" style="color:#fff;font-weight:600">'+x.at+'</td>'
-    +'<td class="mono" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
-    +'<td><span class="badge '+x.cls+'">'+x.label+'</span></td>'
-    +'<td><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
-    +'<td class="spark3">'+spark3+'</td>';
+    +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
+    +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
+    +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
+    +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
+    +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
+    +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
+    +'<td class="spark3" data-label="3 dias">'+spark3+'</td>';
   tbody.appendChild(tr);
 });
 
@@ -562,9 +660,58 @@ escalando.forEach((x,i)=>{
   if(!el)return;
   new Chart(el,{type:"line",data:{labels:datas,datasets:[{data:serie(x.p),borderColor:x.color,backgroundColor:"transparent",borderWidth:2,pointRadius:0,tension:.4,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}},elements:{line:{borderCapStyle:"round"}}}});
 });
+
+// ── Tabela histórica de coletas ──────────────────────────────────────────────
+const HD=__HIST_PLACEHOLDER__;
+const histSection=document.getElementById("hist-section");
+if(!HD.dates.length||!HD.libs.length){
+  histSection.innerHTML='<div class="empty-hint" style="margin:0">Nenhum dado histórico disponível ainda. Aguarde as próximas coletas automáticas.</div>';
+}else{
+  function fdH(dk){const[y,m,d]=dk.split("-");return d+"/"+m+"/"+y.slice(2)}
+  function slotCell(nome,dk,slot){
+    const v=HD.map[nome]?.[dk]?.[slot];
+    if(v===undefined||v===null)return '<span class="hist-slot empty">—</span>';
+    return '<span class="hist-slot">'+v+'</span>';
+  }
+  // Cabeçalho
+  let thead='<thead><tr>'
+    +'<th style="text-align:left;white-space:nowrap">Biblioteca</th>'
+    +'<th style="text-align:left;white-space:nowrap">Data</th>'
+    +'<th style="text-align:center">03h</th>'
+    +'<th style="text-align:center">12h</th>'
+    +'<th style="text-align:center">22h</th>'
+    +'</tr></thead>';
+  // Corpo: para cada biblioteca, para cada data, uma linha
+  let tbody2='<tbody>';
+  let rowCount=0;
+  for(const lib of HD.libs){
+    let firstForLib=true;
+    for(const dk of HD.dates){
+      const slots=HD.map[lib]?.[dk];
+      if(!slots)continue; // sem dado nesse dia pra essa lib
+      const hasAny=slots[3]!==undefined||slots[12]!==undefined||slots[22]!==undefined;
+      if(!hasAny)continue;
+      tbody2+='<tr>'
+        +'<td class="lib-name">'+(firstForLib?lib:'')+'</td>'
+        +'<td class="date-col">'+fdH(dk)+'</td>'
+        +'<td>'+slotCell(lib,dk,3)+'</td>'
+        +'<td>'+slotCell(lib,dk,12)+'</td>'
+        +'<td>'+slotCell(lib,dk,22)+'</td>'
+        +'</tr>';
+      firstForLib=false;
+      rowCount++;
+    }
+    // separador visual entre bibliotecas
+    if(!firstForLib){
+      tbody2+='<tr style="height:4px;background:var(--bg)"><td colspan="5"></td></tr>';
+    }
+  }
+  tbody2+='</tbody>';
+  histSection.innerHTML='<div class="tbl-scroll-x"><table class="hist-tbl">'+thead+tbody2+'</table></div>';
+}
 <\/script>
 </body>
-</html>`.replace("__DADOS_PLACEHOLDER__", dados));
+</html>`.replace("__DADOS_PLACEHOLDER__", dados).replace("__HIST_PLACEHOLDER__", histDados));
   } catch (err) {
     res.status(500).send("Erro: " + err.message);
   }
