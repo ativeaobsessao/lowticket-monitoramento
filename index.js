@@ -325,17 +325,20 @@ app.get("/dashboard", async (_req, res) => {
 
     for (const p of pages) {
       const { rows: hist } = await query(
-        `SELECT ads_count, collected_at FROM scrape_history WHERE slug=$1 ORDER BY collected_at ASC`,
+        `SELECT ads_count,
+                (collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
+         FROM scrape_history WHERE slug=$1 ORDER BY collected_at ASC`,
         [p.slug]
       );
       if (!hist.length) continue;
       ultimaLeitura[p.nome] = { ads: hist[hist.length - 1].ads_count };
-      primeiraData[p.nome] = hist[0].collected_at.toISOString().slice(0, 10);
+      primeiraData[p.nome] = new Date(hist[0].collected_at_br).toISOString().slice(0, 10);
       mon[p.nome] = { ini: hist[0].ads_count };
       paginas[p.nome] = {};
       for (const h of hist) {
-        const dk = h.collected_at.toISOString().slice(0, 10);
-        const hour = h.collected_at.getHours();
+        const brDt = new Date(h.collected_at_br);
+        const dk = brDt.toISOString().slice(0, 10);
+        const hour = brDt.getUTCHours();
         const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
         if (!paginas[p.nome][dk]) paginas[p.nome][dk] = {};
         paginas[p.nome][dk][slot] = h.ads_count;
@@ -347,7 +350,8 @@ app.get("/dashboard", async (_req, res) => {
     // ── Tabela histórica: todas as coletas agrupadas por biblioteca + data + slot ──
     // Busca os últimos 60 dias de histórico pra não sobrecarregar
     const { rows: histAll } = await query(`
-      SELECT p.nome, sh.ads_count, sh.collected_at
+      SELECT p.nome, sh.ads_count,
+             (sh.collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
       FROM scrape_history sh
       JOIN pages p ON p.slug = sh.slug
       WHERE sh.collected_at >= NOW() - INTERVAL '60 days'
@@ -355,11 +359,13 @@ app.get("/dashboard", async (_req, res) => {
     `);
 
     // Monta estrutura: { nome -> { 'YYYY-MM-DD' -> { 3: val, 12: val, 22: val } } }
+    // Todos os horários convertidos para America/Sao_Paulo pelo Postgres
     const histMap = {};
     for (const r of histAll) {
       const nome = r.nome;
-      const dk = r.collected_at.toISOString().slice(0, 10);
-      const hour = r.collected_at.getHours();
+      const brDt = new Date(r.collected_at_br);
+      const dk = brDt.toISOString().slice(0, 10);
+      const hour = brDt.getUTCHours(); // Postgres ja converteu, getUTCHours da a hora BR correta
       const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
       if (!histMap[nome]) histMap[nome] = {};
       if (!histMap[nome][dk]) histMap[nome][dk] = {};
@@ -367,7 +373,7 @@ app.get("/dashboard", async (_req, res) => {
     }
 
     // Lista de datas únicas ordenadas desc (mais recente primeiro)
-    const histDates = [...new Set(histAll.map(r => r.collected_at.toISOString().slice(0, 10)))]
+    const histDates = [...new Set(histAll.map(r => new Date(r.collected_at_br).toISOString().slice(0, 10)))]
       .sort((a, b) => b.localeCompare(a));
 
     // Lista de bibliotecas ordenadas por ads desc (mesmo ordem do resumo)
