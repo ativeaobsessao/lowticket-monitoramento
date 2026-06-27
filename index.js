@@ -48,6 +48,11 @@ async function initDb() {
   await query(`
     CREATE INDEX IF NOT EXISTS idx_scrape_history_slug ON scrape_history(slug)
   `);
+  // Migração: adiciona coluna 'tipo' se ainda não existe.
+  // Registros antigos (sem tipo) viram 'pagina' automaticamente.
+  await query(`
+    ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'
+  `);
   console.log("[DB] Tables ready.");
 }
 
@@ -239,16 +244,18 @@ async function runAllScrapes(trigger = "cron") {
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url } = req.body;
+  const { nome, url, tipo } = req.body;
   if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
+  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   await query(
-    `INSERT INTO pages (slug, nome, url) VALUES ($1, $2, $3) ON CONFLICT (slug) DO UPDATE SET nome = $2, url = $3`,
-    [slug, nome, url]
+    `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (slug) DO UPDATE SET nome = $2, url = $3, tipo = $4`,
+    [slug, nome, url, tipoFinal]
   );
-  console.log(`[SALVAR] registered slug=${slug}`);
-  res.json({ slug, coletarPath: `/api/coletar/${slug}` });
+  console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
+  res.json({ slug, tipo: tipoFinal, coletarPath: `/api/coletar/${slug}` });
 });
 
 app.get("/api/coletar/:slug", async (req, res) => {
@@ -317,69 +324,79 @@ app.get("/api/paginas", async (_req, res) => {
 
 app.get("/dashboard", async (_req, res) => {
   try {
-    const { rows: pages } = await query("SELECT slug, nome FROM pages");
-    const ultimaLeitura = {};
-    const primeiraData = {};
-    const paginas = {};
-    const mon = {};
+    const { rows: allPages } = await query("SELECT slug, nome, tipo FROM pages");
 
-    for (const p of pages) {
-      const { rows: hist } = await query(
-        `SELECT ads_count,
-                (collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
-         FROM scrape_history WHERE slug=$1 ORDER BY collected_at ASC`,
-        [p.slug]
-      );
-      if (!hist.length) continue;
-      ultimaLeitura[p.nome] = { ads: hist[hist.length - 1].ads_count };
-      primeiraData[p.nome] = new Date(hist[0].collected_at_br).toISOString().slice(0, 10);
-      mon[p.nome] = { ini: hist[0].ads_count };
-      paginas[p.nome] = {};
-      for (const h of hist) {
-        const brDt = new Date(h.collected_at_br);
-        const dk = brDt.toISOString().slice(0, 10);
-        const hour = brDt.getUTCHours();
-        const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
-        if (!paginas[p.nome][dk]) paginas[p.nome][dk] = {};
-        paginas[p.nome][dk][slot] = h.ads_count;
+    // Função que processa um conjunto de páginas e devolve os 2 pacotes de dados
+    // (dados gerais + dados da tabela histórica) para aquele grupo.
+    async function processarGrupo(pagesDoGrupo) {
+      const ultimaLeitura = {};
+      const primeiraData = {};
+      const paginas = {};
+      const mon = {};
+
+      for (const p of pagesDoGrupo) {
+        const { rows: hist } = await query(
+          `SELECT ads_count,
+                  (collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
+           FROM scrape_history WHERE slug=$1 ORDER BY collected_at ASC`,
+          [p.slug]
+        );
+        if (!hist.length) continue;
+        ultimaLeitura[p.nome] = { ads: hist[hist.length - 1].ads_count };
+        primeiraData[p.nome] = new Date(hist[0].collected_at_br).toISOString().slice(0, 10);
+        mon[p.nome] = { ini: hist[0].ads_count };
+        paginas[p.nome] = {};
+        for (const h of hist) {
+          const brDt = new Date(h.collected_at_br);
+          const dk = brDt.toISOString().slice(0, 10);
+          const hour = brDt.getUTCHours();
+          const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
+          if (!paginas[p.nome][dk]) paginas[p.nome][dk] = {};
+          paginas[p.nome][dk][slot] = h.ads_count;
+        }
       }
+
+      // Tabela histórica do grupo
+      const slugs = pagesDoGrupo.map(p => p.slug);
+      let histMap = {}, histDates = [];
+      if (slugs.length) {
+        const { rows: histAll } = await query(`
+          SELECT p.nome, sh.ads_count,
+                 (sh.collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
+          FROM scrape_history sh
+          JOIN pages p ON p.slug = sh.slug
+          WHERE sh.slug = ANY($1) AND sh.collected_at >= NOW() - INTERVAL '60 days'
+          ORDER BY sh.collected_at DESC
+        `, [slugs]);
+        for (const r of histAll) {
+          const nome = r.nome;
+          const brDt = new Date(r.collected_at_br);
+          const dk = brDt.toISOString().slice(0, 10);
+          const hour = brDt.getUTCHours();
+          const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
+          if (!histMap[nome]) histMap[nome] = {};
+          if (!histMap[nome][dk]) histMap[nome][dk] = {};
+          if (histMap[nome][dk][slot] === undefined) histMap[nome][dk][slot] = r.ads_count;
+        }
+        histDates = [...new Set(histAll.map(r => new Date(r.collected_at_br).toISOString().slice(0, 10)))]
+          .sort((a, b) => b.localeCompare(a));
+      }
+      const histLibs = Object.keys(paginas).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
+
+      return {
+        geral: { pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon },
+        hist: { map: histMap, dates: histDates, libs: histLibs },
+        count: Object.keys(paginas).length,
+      };
     }
 
-    const dados = JSON.stringify({ pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon });
+    const grupoPaginas = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
+    const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
 
-    // ── Tabela histórica: todas as coletas agrupadas por biblioteca + data + slot ──
-    // Busca os últimos 60 dias de histórico pra não sobrecarregar
-    const { rows: histAll } = await query(`
-      SELECT p.nome, sh.ads_count,
-             (sh.collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
-      FROM scrape_history sh
-      JOIN pages p ON p.slug = sh.slug
-      WHERE sh.collected_at >= NOW() - INTERVAL '60 days'
-      ORDER BY sh.collected_at DESC
-    `);
-
-    // Monta estrutura: { nome -> { 'YYYY-MM-DD' -> { 3: val, 12: val, 22: val } } }
-    // Todos os horários convertidos para America/Sao_Paulo pelo Postgres
-    const histMap = {};
-    for (const r of histAll) {
-      const nome = r.nome;
-      const brDt = new Date(r.collected_at_br);
-      const dk = brDt.toISOString().slice(0, 10);
-      const hour = brDt.getUTCHours(); // Postgres ja converteu, getUTCHours da a hora BR correta
-      const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
-      if (!histMap[nome]) histMap[nome] = {};
-      if (!histMap[nome][dk]) histMap[nome][dk] = {};
-      if (histMap[nome][dk][slot] === undefined) histMap[nome][dk][slot] = r.ads_count;
-    }
-
-    // Lista de datas únicas ordenadas desc (mais recente primeiro)
-    const histDates = [...new Set(histAll.map(r => new Date(r.collected_at_br).toISOString().slice(0, 10)))]
-      .sort((a, b) => b.localeCompare(a));
-
-    // Lista de bibliotecas ordenadas por ads desc (mesmo ordem do resumo)
-    const histLibs = Object.keys(paginas).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
-
-    const histDados = JSON.stringify({ map: histMap, dates: histDates, libs: histLibs });
+    const dados = JSON.stringify(grupoPaginas.geral);
+    const histDados = JSON.stringify(grupoPaginas.hist);
+    const dadosDom = JSON.stringify(grupoDominios.geral);
+    const histDadosDom = JSON.stringify(grupoDominios.hist);
 
     res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
@@ -502,6 +519,7 @@ tbody tr:hover td{background:var(--surface2)}
 @media(max-width:480px){
   .scaling-strip{grid-template-columns:1fr}
 }
+.group-title{font-size:15px;font-weight:700;color:#fff;letter-spacing:.4px;margin:0 0 16px 2px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
 </style>
 </head>
 <body>
@@ -515,42 +533,83 @@ tbody tr:hover td{background:var(--surface2)}
   <div class="hdr-live"><span class="dot"></span><span id="livecount"></span></div>
 </div>
 
-<div class="section-label">🚀 Escalando agora — ofertas em ascensão</div>
-<div class="scaling-strip" id="scaling"></div>
-<div class="empty-hint" id="scaling-empty" style="display:none">Nenhuma biblioteca em ascensão no período. Conforme as coletas acumulam, as ofertas que crescem aparecem aqui.</div>
+<div class="group-title">🌐 DOMÍNIOS — rastreio por URL</div>
+
+<div class="section-label">🚀 Escalando agora — domínios em ascensão</div>
+<div class="scaling-strip" id="dom_scaling"></div>
+<div class="empty-hint" id="dom_scaling-empty" style="display:none">Nenhum item em ascensão no período. Conforme as coletas acumulam, o que cresce aparece aqui.</div>
 
 <div class="grid-charts">
   <div class="panel">
     <div class="panel-title">🍩 Distribuição atual</div>
     <div class="rosca-wrap">
-      <div class="rosca-canvas"><canvas id="cRosca"></canvas></div>
-      <div class="legend" id="legend"></div>
+      <div class="rosca-canvas"><canvas id="dom_cRosca"></canvas></div>
+      <div class="legend" id="dom_legend"></div>
     </div>
   </div>
   <div class="panel">
     <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
-    <div class="hist-box"><canvas id="cHist"></canvas></div>
+    <div class="hist-box"><canvas id="dom_cHist"></canvas></div>
   </div>
 </div>
 
-<div class="section-label">📋 Resumo completo — todas as bibliotecas</div>
+<div class="section-label">📋 Resumo completo</div>
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Biblioteca</th><th>Descoberta</th><th>Inicial</th><th>Atual</th>
+      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th>
       <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
     </tr></thead>
-    <tbody id="tbody"></tbody>
+    <tbody id="dom_tbody"></tbody>
   </table>
 </div>
 
-<div class="section-label" style="margin-top:26px">📅 Histórico de coletas — por biblioteca · 03h · 12h · 22h</div>
-<div class="tbl-panel" id="hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
+<div class="section-label" style="margin-top:26px">📅 Histórico de coletas · 03h · 12h · 22h</div>
+<div class="tbl-panel" id="dom_hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
+  Carregando histórico...
+</div>
+
+<div style="height:30px"></div>
+
+<div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
+
+<div class="section-label">🚀 Escalando agora — bibliotecas em ascensão</div>
+<div class="scaling-strip" id="pag_scaling"></div>
+<div class="empty-hint" id="pag_scaling-empty" style="display:none">Nenhum item em ascensão no período. Conforme as coletas acumulam, o que cresce aparece aqui.</div>
+
+<div class="grid-charts">
+  <div class="panel">
+    <div class="panel-title">🍩 Distribuição atual</div>
+    <div class="rosca-wrap">
+      <div class="rosca-canvas"><canvas id="pag_cRosca"></canvas></div>
+      <div class="legend" id="pag_legend"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+    <div class="hist-box"><canvas id="pag_cHist"></canvas></div>
+  </div>
+</div>
+
+<div class="section-label">📋 Resumo completo</div>
+<div class="tbl-panel">
+  <table>
+    <thead><tr>
+      <th>#</th><th>Bibliotecas</th><th>Descoberta</th><th>Inicial</th><th>Atual</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
+    </tr></thead>
+    <tbody id="pag_tbody"></tbody>
+  </table>
+</div>
+
+<div class="section-label" style="margin-top:26px">📅 Histórico de coletas · 03h · 12h · 22h</div>
+<div class="tbl-panel" id="pag_hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
   Carregando histórico...
 </div>
 
 <script>
-const D=__DADOS_PLACEHOLDER__;
+document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  coletas 03h · 12h · 22h";
+function render(D,HD,P){
 const COR=["#7c6fff","#34d399","#fb7185","#fbbf24","#22d3ee","#a78bfa","#f97316","#4ade80","#ec4899","#38bdf8","#facc15","#2dd4bf","#fb923c","#a3e635","#e879f9","#60a5fa"];
 function med(s){const v=Object.values(s).filter(x=>!isNaN(x));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null}
 function fd(dk){const[y,m,d]=dk.split("-");return d+"/"+m}
@@ -561,8 +620,6 @@ const dSet=new Set();LP.forEach(p=>Object.keys(pags[p]).forEach(d=>dSet.add(d)))
 const datas=Array.from(dSet).sort();
 const ult=datas[datas.length-1];
 
-document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  coletas 03h · 12h · 22h";
-document.getElementById("livecount").textContent=LP.length+" bibliotecas";
 
 function serie(pag){return datas.map(dk=>pags[pag]?.[dk]?med(pags[pag][dk]):null)}
 function slope(pag){
@@ -595,9 +652,9 @@ const escalando=LP.map(p=>({p,...info(p)}))
   .filter(x=>x.at>0&&(x.label==="Escalando forte"||x.label==="Crescendo"||x.label==="Subindo")&&x.pct>0)
   .sort((a,b)=>b.pct-a.pct);
 
-const strip=document.getElementById("scaling");
+const strip=document.getElementById(P+"scaling");
 if(escalando.length===0){
-  document.getElementById("scaling-empty").style.display="block";
+  document.getElementById(P+"scaling-empty").style.display="block";
 }else{
   escalando.forEach((x,i)=>{
     const card=document.createElement("div");
@@ -607,12 +664,12 @@ if(escalando.length===0){
       +'<div class="scale-card-val">'+x.at.toLocaleString("pt-BR")+'</div>'
       +'<div class="scale-card-meta"><span class="scale-pct" style="color:'+x.color+'">'+(x.pct>=0?"+":"")+x.pct+'%</span>'
       +'<span style="color:var(--muted)">'+(x.vn>=0?"+":"")+x.vn+' ads desde início</span></div>'
-      +'<div class="scale-spark"><canvas id="spark'+i+'"></canvas></div>';
+      +'<div class="scale-spark"><canvas id="'+P+'spark'+i+'"></canvas></div>';
     strip.appendChild(card);
   });
 }
 
-const tbody=document.getElementById("tbody");
+const tbody=document.getElementById(P+"tbody");
 porAds.forEach((pag,idx)=>{
   const x=info(pag);
   const did=primeira[pag]?fdFull(primeira[pag]):"—";
@@ -636,7 +693,7 @@ porAds.forEach((pag,idx)=>{
 
 const ro=porAds.filter(p=>(ultima[p]?.ads||0)>0);
 const totalRo=ro.reduce((s,p)=>s+(ultima[p]?.ads||0),0);
-const legend=document.getElementById("legend");
+const legend=document.getElementById(P+"legend");
 ro.forEach((p,i)=>{
   const at=ultima[p]?.ads||0;
   const pct=totalRo>0?Math.round((at/totalRo)*100):0;
@@ -648,28 +705,27 @@ ro.forEach((p,i)=>{
   legend.appendChild(it);
 });
 
-new Chart(document.getElementById("cRosca"),{
+new Chart(document.getElementById(P+"cRosca"),{
   type:"doughnut",
   data:{labels:ro,datasets:[{data:ro.map(p=>ultima[p]?.ads||0),backgroundColor:ro.map(p=>COR[porAds.indexOf(p)%COR.length]),borderWidth:2,borderColor:"#12121f"}]},
   options:{responsive:true,maintainAspectRatio:false,cutout:"62%",plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>" "+ctx.label+": "+ctx.parsed.toLocaleString("pt-BR")+" ads"}}}}
 });
 
 const LP_hist=porAds.slice(0,8);
-new Chart(document.getElementById("cHist"),{
+new Chart(document.getElementById(P+"cHist"),{
   type:"line",
   data:{labels:datas.map(fd),datasets:LP_hist.map((p)=>{const didK=primeira[p]||null;const c=COR[porAds.indexOf(p)%COR.length];return{label:p,data:serie(p),borderColor:c,backgroundColor:"transparent",borderWidth:2,pointBackgroundColor:datas.map(dk=>dk===didK?"#fb7185":c),pointRadius:datas.map(dk=>dk===didK?5:2),pointHoverRadius:6,tension:.35,spanGaps:true};})},
   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"bottom",labels:{color:"#b8b8d0",font:{size:11,family:"Space Grotesk"},padding:10,boxWidth:8,usePointStyle:true}},tooltip:{callbacks:{label:ctx=>" "+ctx.dataset.label+": "+(ctx.parsed.y??"—")+" ads"}}},scales:{x:{ticks:{color:"#7a7a98",font:{size:11}},grid:{color:"#1c1c30"}},y:{ticks:{color:"#7a7a98",font:{size:11}},grid:{color:"#1c1c30"},beginAtZero:false}}}
 });
 
 escalando.forEach((x,i)=>{
-  const el=document.getElementById("spark"+i);
+  const el=document.getElementById(P+"spark"+i);
   if(!el)return;
   new Chart(el,{type:"line",data:{labels:datas,datasets:[{data:serie(x.p),borderColor:x.color,backgroundColor:"transparent",borderWidth:2,pointRadius:0,tension:.4,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}},elements:{line:{borderCapStyle:"round"}}}});
 });
 
 // ── Tabela histórica de coletas ──────────────────────────────────────────────
-const HD=__HIST_PLACEHOLDER__;
-const histSection=document.getElementById("hist-section");
+const histSection=document.getElementById(P+"hist-section");
 if(!HD.dates.length||!HD.libs.length){
   histSection.innerHTML='<div class="empty-hint" style="margin:0">Nenhum dado histórico disponível ainda. Aguarde as próximas coletas automáticas.</div>';
 }else{
@@ -715,9 +771,26 @@ if(!HD.dates.length||!HD.libs.length){
   tbody2+='</tbody>';
   histSection.innerHTML='<div class="tbl-scroll-x"><table class="hist-tbl">'+thead+tbody2+'</table></div>';
 }
+}
+
+const D_DOM=__DADOS_DOM__;
+const HD_DOM=__HIST_DOM__;
+const D_PAG=__DADOS_PLACEHOLDER__;
+const HD_PAG=__HIST_PLACEHOLDER__;
+
+const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length;
+document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_PAG.pags).length+" bibliotecas";
+
+render(D_DOM,HD_DOM,"dom_");
+render(D_PAG,HD_PAG,"pag_");
+
 <\/script>
 </body>
-</html>`.replace("__DADOS_PLACEHOLDER__", dados).replace("__HIST_PLACEHOLDER__", histDados));
+</html>`
+      .replace("__DADOS_DOM__", dadosDom)
+      .replace("__HIST_DOM__", histDadosDom)
+      .replace("__DADOS_PLACEHOLDER__", dados)
+      .replace("__HIST_PLACEHOLDER__", histDados));
   } catch (err) {
     res.status(500).send("Erro: " + err.message);
   }
