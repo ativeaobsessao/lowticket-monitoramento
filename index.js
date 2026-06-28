@@ -586,6 +586,16 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .empty-hint{background:var(--surface);border:1px dashed var(--border);border-radius:12px;padding:22px;text-align:center;color:var(--muted);font-size:13px;margin-bottom:26px}
 .lib-link{color:var(--text);text-decoration:none;border-bottom:1px solid var(--border);padding-bottom:1px;transition:color .15s,border-color .15s}
 .lib-link:hover{color:var(--accent);border-color:var(--accent)}
+
+/* ── Accordion histórico ── */
+.accordion-wrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.accordion-btn{width:100%;display:flex;align-items:center;gap:10px;padding:14px 18px;background:transparent;border:none;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;cursor:pointer;text-align:left;transition:background .15s}
+.accordion-btn:hover{background:var(--surface2)}
+.acc-meta{font-size:11px;color:var(--muted);font-family:'Space Mono',monospace;margin-left:4px}
+.acc-icon{margin-left:auto;font-size:12px;color:var(--muted);transition:transform .25s;flex-shrink:0}
+.acc-icon.open{transform:rotate(180deg)}
+.accordion-body{display:none;padding:0 18px 16px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.accordion-body.open{display:block}
 .grid-charts{display:grid;grid-template-columns:380px 1fr;gap:14px;margin-bottom:26px}
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
 .panel-title{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
@@ -722,11 +732,6 @@ tbody tr:hover td{background:var(--surface2)}
   </table>
 </div>
 
-<div class="section-label" style="margin-top:26px">📅 Histórico de coletas — Domínio · 03h · 12h · 22h</div>
-<div class="tbl-panel" id="dom_hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
-  Carregando histórico...
-</div>
-
 <div style="height:36px"></div>
 
 <div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
@@ -760,13 +765,43 @@ tbody tr:hover td{background:var(--surface2)}
   </table>
 </div>
 
-<div class="section-label" style="margin-top:26px">📅 Histórico de coletas — Bibliotecas · 03h · 12h · 22h</div>
-<div class="tbl-panel" id="pag_hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
-  Carregando histórico...
+<div style="height:36px"></div>
+
+<!-- HISTÓRICOS NO FINAL — accordion colapsável -->
+<div class="group-title">📅 Histórico de Coletas</div>
+
+<div class="accordion-wrap">
+  <button class="accordion-btn" onclick="toggleAccordion('dom_hist-section','dom_acc-icon')">
+    <span>🌐 Histórico de Coletas — Domínios · 03h · 12h · 22h</span>
+    <span class="acc-meta" id="dom_acc-meta"></span>
+    <span class="acc-icon" id="dom_acc-icon">▼</span>
+  </button>
+  <div class="accordion-body" id="dom_hist-section">
+    Carregando histórico...
+  </div>
+</div>
+
+<div class="accordion-wrap" style="margin-top:12px">
+  <button class="accordion-btn" onclick="toggleAccordion('pag_hist-section','pag_acc-icon')">
+    <span>📡 Histórico de Coletas — Bibliotecas · 03h · 12h · 22h</span>
+    <span class="acc-meta" id="pag_acc-meta"></span>
+    <span class="acc-icon" id="pag_acc-icon">▼</span>
+  </button>
+  <div class="accordion-body" id="pag_hist-section">
+    Carregando histórico...
+  </div>
 </div>
 
 <script>
 document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  coletas 03h · 12h · 22h";
+
+function toggleAccordion(bodyId, iconId){
+  const body=document.getElementById(bodyId);
+  const icon=document.getElementById(iconId);
+  body.classList.toggle('open');
+  icon.classList.toggle('open');
+}
+
 function render(D,HD,P){
 const COR=["#7c6fff","#34d399","#fb7185","#fbbf24","#22d3ee","#a78bfa","#f97316","#4ade80","#ec4899","#38bdf8","#facc15","#2dd4bf","#fb923c","#a3e635","#e879f9","#60a5fa"];
 function med(s){const v=Object.values(s).filter(x=>!isNaN(x));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null}
@@ -928,6 +963,9 @@ if(!HD.dates.length||!HD.libs.length){
   }
   tbody2+='</tbody>';
   histSection.innerHTML='<div class="tbl-scroll-x"><table class="hist-tbl">'+thead+tbody2+'</table></div>';
+  // Atualiza badge de contagem no botão do accordion
+  const metaEl=document.getElementById(P+"acc-meta");
+  if(metaEl) metaEl.textContent='('+rowCount+' registros)';
 }
 }
 
