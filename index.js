@@ -937,8 +937,8 @@ porAds.forEach((pag,idx)=>{
   +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
   +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
   +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
-  +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:\'Space Mono\',monospace;font-size:11px">'
-  +'(ultima[pag]?.ultimaColeta ? new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—')
+  +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
+  +(ultima[pag]?.ultimaColeta ? new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—')
   +'</td>'
   +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
   +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
