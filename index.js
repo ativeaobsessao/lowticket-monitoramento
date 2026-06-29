@@ -48,6 +48,15 @@ async function initDb() {
   await query(`
     CREATE INDEX IF NOT EXISTS idx_scrape_history_slug ON scrape_history(slug)
   `);
+  // Tabela para última leitura de cada slug (coleta manual e automática)
+// Só guarda 1 linha por slug — sempre o valor mais recente
+await query(`
+  CREATE TABLE IF NOT EXISTS scrape_latest (
+    slug         TEXT PRIMARY KEY,
+    ads_count    INTEGER NOT NULL,
+    collected_at TIMESTAMP NOT NULL DEFAULT NOW()
+  )
+`);
   await query(`
   CREATE TABLE IF NOT EXISTS scrape_latest (
     slug         TEXT PRIMARY KEY,
@@ -252,7 +261,7 @@ if (trigger.startsWith('cron')) {
      ON CONFLICT (slug) DO UPDATE
        SET ads_count    = EXCLUDED.ads_count,
            collected_at = EXCLUDED.collected_at`,
-    [p.slug, final]
+    [slug, final]
   );
   console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
 }
@@ -935,17 +944,18 @@ porAds.forEach((pag,idx)=>{
     +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
     // Após a célula do Atual, adicionar:
-+'<td style="color:var(--muted);font-family:\'Space Mono\',monospace;font-size:11px">'
-  +(ultima[pag]?.ultimaColeta
+    +'<td style="color:var(--muted);font-family:\'Space Mono\',monospace;font-size:11px">'
+    +(ultima[pag]?.ultimaColeta
     ? new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})
     : '—')
-+'</td>'
+    +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
     +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
     +'<td class="spark3" data-label="3 dias">'+spark3+'</td>';
   tbody.appendChild(tr);
 });
+
 
 const ro=porAds.filter(p=>(ultima[p]?.ads||0)>0);
 const totalRo=ro.reduce((s,p)=>s+(ultima[p]?.ads||0),0);
@@ -1063,9 +1073,10 @@ cron.schedule("0 12 * * *", () => runAllScrapes("cron-12h"), { timezone: TZ });
 cron.schedule("0 22 * * *", () => runAllScrapes("cron-22h"), { timezone: TZ });
 console.log(`[CRON] scheduled 03h/12h/22h (${TZ})`);
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// --- Start --------------------------------------------
 
 const PORT = process.env.PORT || 3000;
+
 initDb().then(() => {
   app.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`));
 });
