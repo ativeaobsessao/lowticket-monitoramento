@@ -1066,11 +1066,6 @@ console.log(`[CRON] scheduled 03h/12h/22h (${TZ})`);
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-initDb().then
-
-// ─── Start ────────────────────────────────────────────────────────────────────
-
-const PORT = process.env.PORT || 3000;
 initDb().then(() => {
   app.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`));
 });
