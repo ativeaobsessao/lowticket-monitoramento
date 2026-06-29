@@ -153,6 +153,15 @@ async function saveCount(slug, count) {
     `SELECT id FROM scrape_history WHERE slug = $1 AND collected_at >= NOW() - INTERVAL '60 seconds' LIMIT 1`,
     [slug]
   );
+ // Sempre atualiza o "atual" na scrape_latest (independente de duplicata)
+await query(
+  `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+   VALUES ($1, $2, NOW())
+   ON CONFLICT (slug) DO UPDATE
+     SET ads_count    = EXCLUDED.ads_count,
+         collected_at = EXCLUDED.collected_at`,
+  [slug, count]
+); 
   if (recent.length === 0) {
     await query("INSERT INTO scrape_history (slug, ads_count) VALUES ($1, $2)", [slug, count]);
     console.log(`[HISTORY] slug=${slug} count=${count} saved`);
@@ -223,7 +232,23 @@ async function runAllScrapes(trigger = "cron") {
         }
       }
       const final = count ?? 0;
-      await saveCount(p.slug, final);
+      // DEPOIS:
+// Sempre atualiza scrape_latest (via saveCount)
+// Só salva em scrape_history se for coleta automática do cron
+if (trigger.startsWith('cron')) {
+  await saveCount(p.slug, final);
+} else {
+  // Coleta manual: atualiza apenas o "atual" sem poluir o histórico
+  await query(
+    `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (slug) DO UPDATE
+       SET ads_count    = EXCLUDED.ads_count,
+           collected_at = EXCLUDED.collected_at`,
+    [slug, final]
+  );
+  console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
+}
       results.push({ slug: p.slug, nome: p.nome, count: final });
     }
   } catch (err) {
@@ -498,7 +523,19 @@ app.get("/dashboard", async (_req, res) => {
           [p.slug]
         );
         if (!hist.length) continue;
-        ultimaLeitura[p.nome] = { ads: hist[hist.length - 1].ads_count, url: p.url };
+     // Lê o valor atual e a data da última checagem da scrape_latest
+const { rows: latest } = await query(
+  `SELECT ads_count,
+          (collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
+   FROM scrape_latest WHERE slug = $1 LIMIT 1`,
+  [p.slug]
+);
+const latestRow = latest[0];
+ultimaLeitura[p.nome] = {
+  ads:          latestRow ? latestRow.ads_count : hist[hist.length - 1].ads_count,
+  url:          p.url,
+  ultimaColeta: latestRow ? new Date(latestRow.collected_at_br).toISOString() : null,
+};
         primeiraData[p.nome] = new Date(hist[0].collected_at_br).toISOString().slice(0, 10);
         mon[p.nome] = { ini: hist[0].ads_count };
         paginas[p.nome] = {};
@@ -725,8 +762,8 @@ tbody tr:hover td{background:var(--surface2)}
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
+     <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th>
+<th>Última Checagem</th><th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
   </table>
@@ -877,6 +914,12 @@ porAds.forEach((pag,idx)=>{
     +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
     +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
+    // Após a célula do Atual, adicionar:
++'<td style="color:var(--muted);font-family:\'Space Mono\',monospace;font-size:11px">'
+  +(ultima[pag]?.ultimaColeta
+    ? new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})
+    : '—')
++'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
     +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
@@ -1006,3 +1049,15 @@ const PORT = process.env.PORT || 3000;
 initDb().then(() => {
   app.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`));
 });
+<<<<<<< HEAD
+=======
+// Tabela para última leitura de cada slug (coleta manual e automática)
+// Só guarda 1 linha por slug — sempre o valor mais recente
+await query(`
+  CREATE TABLE IF NOT EXISTS scrape_latest (
+    slug         TEXT PRIMARY KEY,
+    ads_count    INTEGER NOT NULL,
+    collected_at TIMESTAMP NOT NULL DEFAULT NOW()
+  )
+`);
+>>>>>>> f1f4681 (scrape_latest: separa coleta manual do historico)
