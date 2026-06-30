@@ -1057,11 +1057,12 @@ render(D_PAG,HD_PAG,"pag_");
 
 // ─── Scheduler (internal cron — replaces Make.com) ──────────────────────────────
 
-const TZ = "America/Sao_Paulo";
-cron.schedule("0 3 * * *", () => runAllScrapes("cron-03h"), { timezone: TZ });
-cron.schedule("0 12 * * *", () => runAllScrapes("cron-12h"), { timezone: TZ });
-cron.schedule("0 22 * * *", () => runAllScrapes("cron-22h"), { timezone: TZ });
-console.log(`[CRON] scheduled 03h/12h/22h (${TZ})`);
+// Cron em UTC explicito — equivalente aos horarios de Brasilia (UTC-3):
+// 03h BR = 06h UTC | 12h BR = 15h UTC | 22h BR = 01h UTC (dia seguinte)
+cron.schedule("0 6 * * *",  () => runAllScrapes("cron-03h"), { timezone: "UTC" });
+cron.schedule("0 15 * * *", () => runAllScrapes("cron-12h"), { timezone: "UTC" });
+cron.schedule("0 1 * * *",  () => runAllScrapes("cron-22h"), { timezone: "UTC" });
+console.log("[CRON] scheduled 03h/12h/22h BRT = 06h/15h/01h UTC");
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
