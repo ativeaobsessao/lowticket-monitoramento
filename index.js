@@ -536,7 +536,7 @@ app.get("/dashboard", async (_req, res) => {
 
       for (const p of pagesDoGrupo) {
         const { rows: hist } = await query(
-          `SELECT ads_count,
+          `SELECT ads_count, slot,
                   (collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
            FROM scrape_history WHERE slug=$1 ORDER BY collected_at ASC`,
           [p.slug]
@@ -565,8 +565,10 @@ app.get("/dashboard", async (_req, res) => {
         for (const h of hist) {
           const brDt = new Date(h.collected_at_br);
           const dk = brDt.toISOString().slice(0, 10);
-          const hour = brDt.getUTCHours();
-          const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
+          // Novo sistema: usa h.slot direto. Fallback por hora para registros antigos (slot null)
+          const slot = (h.slot !== null && h.slot !== undefined)
+            ? Number(h.slot)
+            : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
           if (!paginas[p.nome][dk]) paginas[p.nome][dk] = {};
           paginas[p.nome][dk][slot] = h.ads_count;
         }
@@ -577,7 +579,7 @@ app.get("/dashboard", async (_req, res) => {
       let histMap = {}, histDates = [];
       if (slugs.length) {
         const { rows: histAll } = await query(`
-          SELECT p.nome, sh.ads_count,
+          SELECT p.nome, sh.ads_count, sh.slot,
                  (sh.collected_at AT TIME ZONE 'America/Sao_Paulo') AS collected_at_br
           FROM scrape_history sh
           JOIN pages p ON p.slug = sh.slug
@@ -588,8 +590,10 @@ app.get("/dashboard", async (_req, res) => {
           const nome = r.nome;
           const brDt = new Date(r.collected_at_br);
           const dk = brDt.toISOString().slice(0, 10);
-          const hour = brDt.getUTCHours();
-          const slot = [3, 12, 22].reduce((b, s) => Math.abs(hour - s) < Math.abs(hour - b) ? s : b, 3);
+          // Novo sistema: usa r.slot direto. Fallback por hora para registros antigos (slot null)
+          const slot = (r.slot !== null && r.slot !== undefined)
+            ? Number(r.slot)
+            : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
           if (!histMap[nome]) histMap[nome] = {};
           if (!histMap[nome][dk]) histMap[nome][dk] = {};
           if (histMap[nome][dk][slot] === undefined) histMap[nome][dk][slot] = r.ads_count;
@@ -1057,8 +1061,7 @@ render(D_PAG,HD_PAG,"pag_");
 
 // ─── Scheduler (internal cron — replaces Make.com) ──────────────────────────────
 
-// Cron em UTC explicito — equivalente aos horarios de Brasilia (UTC-3):
-// 03h BR = 06h UTC | 12h BR = 15h UTC | 22h BR = 01h UTC (dia seguinte)
+// Cron em UTC explicito: 03h BR=06h UTC | 12h BR=15h UTC | 22h BR=01h UTC
 cron.schedule("0 6 * * *",  () => runAllScrapes("cron-03h"), { timezone: "UTC" });
 cron.schedule("0 15 * * *", () => runAllScrapes("cron-12h"), { timezone: "UTC" });
 cron.schedule("0 1 * * *",  () => runAllScrapes("cron-22h"), { timezone: "UTC" });
