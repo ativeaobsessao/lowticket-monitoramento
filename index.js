@@ -163,6 +163,7 @@ async function scrapeAdCount(url, retries = 3) {
 }
 
 async function saveCount(slug, count, slot) {
+  console.log(`[SAVECOUNT] slug=${slug} slot=${slot}`);
   const { rows: recent } = await query(
     `SELECT id FROM scrape_history WHERE slug = $1 AND collected_at >= NOW() - INTERVAL '60 seconds' LIMIT 1`,
     [slug]
