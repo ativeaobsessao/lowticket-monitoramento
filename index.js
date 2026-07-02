@@ -328,7 +328,7 @@ app.get("/api/coletar/:slug", async (req, res) => {
   try {
     const count = await scrapeAdCount(row.url);
     res.type("text/plain").send(String(count));
-    await saveCount(slug, count, null);
+    await saveCount(slug, count, null); // coleta manual
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
     res.type("text/plain").send("0");
