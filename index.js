@@ -162,7 +162,7 @@ async function scrapeAdCount(url, retries = 3) {
   return 0;
 }
 
-async function saveCount(slug, count) {
+async function saveCount(slug, count, slot) {
   const { rows: recent } = await query(
     `SELECT id FROM scrape_history WHERE slug = $1 AND collected_at >= NOW() - INTERVAL '60 seconds' LIMIT 1`,
     [slug]
@@ -179,12 +179,29 @@ async function saveCount(slug, count) {
   );
 
   if (recent.length === 0) {
-    await query("INSERT INTO scrape_history (slug, ads_count) VALUES ($1, $2)", [slug, count]);
+    await query("INSERT INTO scrape_history (slug, ads_count, slot) VALUES ($1, $2, $3)", [slug, count, slot]);
     console.log(`[HISTORY] slug=${slug} count=${count} saved`);
   } else {
     console.log(`[HISTORY] slug=${slug} skipped duplicate`);
   }
 }
+
+function resolveSlot(trigger) {
+  switch (trigger) {
+    case "cron-03h":
+      return 3;
+
+    case "cron-12h":
+      return 12;
+
+    case "cron-22h":
+      return 22;
+
+    default:
+      return null;
+  }
+}
+
 
 // ─── Optional: mirror to Google Sheet (backup) ──────────────────────────────────
 // Set SHEET_WEBHOOK_URL env var to a Make.com/Apps Script webhook to keep the
@@ -252,7 +269,8 @@ async function runAllScrapes(trigger = "cron") {
     // Sempre atualiza scrape_latest (via saveCount)
     // Só salva em scrape_history se for coleta automática do cron
     if (trigger.startsWith('cron')) {
-      await saveCount(p.slug, final);
+      const slot = resolveSlot(trigger);
+      await saveCount(p.slug, final, slot);
     } else 
       
       {
@@ -310,7 +328,7 @@ app.get("/api/coletar/:slug", async (req, res) => {
   try {
     const count = await scrapeAdCount(row.url);
     res.type("text/plain").send(String(count));
-    await saveCount(slug, count);
+    await saveCount(slug, count, null);
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
     res.type("text/plain").send("0");
