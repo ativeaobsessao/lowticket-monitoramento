@@ -66,6 +66,15 @@ async function initDb() {
     ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'
   `);
 
+  // FIX #4 — Migração: coluna que guarda o snapshot de ads_count capturado
+  // no EXATO momento do cadastro. Uma vez preenchida, nunca é sobrescrita —
+  // é o baseline imutável usado como "Inicial" na dashboard. Itens antigos
+  // (cadastrados antes dessa migração) ficam com NULL e o dashboard cai no
+  // fallback (primeira linha de scrape_history), preservando compatibilidade.
+  await query(`
+    ALTER TABLE pages ADD COLUMN IF NOT EXISTS inicial_count INTEGER
+  `);
+
   console.log("[DB] Tables ready.");
 }
 
@@ -195,6 +204,36 @@ async function saveCount(slug, count, slot) {
     console.log(`[HISTORY] slug=${slug} slot=${slot} count=${count} saved`);
   } else {
     console.log(`[HISTORY] slug=${slug} slot=${slot} skipped duplicate`);
+  }
+}
+
+// ─── FIX #4: captura Descoberta+Inicial no exato momento do cadastro ─────────
+// Chamada logo após o INSERT em 'pages'. Faz UMA coleta síncrona da URL e:
+//   1. Grava em pages.inicial_count — só se ainda estiver NULL (COALESCE),
+//      pra nunca sobrescrever o baseline em caso de re-cadastro/edição.
+//   2. Atualiza scrape_latest, pra "Atual" já aparecer certo na dashboard.
+// NÃO grava em scrape_history — isso continua sendo território exclusivo
+// do cron, mantendo a regra do blueprint intacta.
+async function captureInicial(slug, url) {
+  try {
+    const count = await scrapeAdCount(url, 2); // 2 tentativas — não travar demais o form
+    await query(
+      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
+      [slug, count]
+    );
+    await query(
+      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (slug) DO UPDATE 
+         SET ads_count    = EXCLUDED.ads_count,
+             collected_at = EXCLUDED.collected_at`,
+      [slug, count]
+    );
+    console.log(`[DESCOBERTA] slug=${slug} inicial=${count} capturado no cadastro`);
+    return count;
+  } catch (err) {
+    console.error(`[DESCOBERTA] falha ao capturar inicial de slug=${slug}: ${err.message}`);
+    return null;
   }
 }
 
@@ -329,7 +368,8 @@ app.post("/api/salvar", async (req, res) => {
     [slug, nome, url, tipoFinal]
   );
   console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
-  res.json({ slug, tipo: tipoFinal, coletarPath: `/api/coletar/${slug}` });
+  const inicial = await captureInicial(slug, url); // FIX #4: grava Descoberta+Inicial na hora
+  res.json({ slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${slug}` });
 });
 
 // ─── FIX #1: /api/coletar/:slug era uma segunda porta de entrada "manual" que
@@ -544,6 +584,7 @@ app.post("/admin/salvar", async (req, res) => {
       [slug, nome, url, tipoFinal]
     );
     console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
+    await captureInicial(slug, url); // FIX #4: grava Descoberta+Inicial na hora (15-30s de espera)
     res.redirect("/admin?ok=1");
   } catch(err) {
     console.error("[ADMIN] erro:", err.message);
@@ -562,7 +603,7 @@ app.post("/admin/remover", async (req, res) => {
 
 app.get("/dashboard", async (_req, res) => {
   try {
-    const { rows: allPages } = await query("SELECT slug, nome, url, tipo FROM pages");
+    const { rows: allPages } = await query("SELECT slug, nome, url, tipo, created_at, inicial_count FROM pages");
 
     // ─── FIX #3: conversão de fuso duplicada ──────────────────────────────
     // As colunas collected_at são TIMESTAMP (sem timezone) e o valor gravado
@@ -593,7 +634,6 @@ app.get("/dashboard", async (_req, res) => {
            FROM scrape_history WHERE slug=$1 ORDER BY collected_at ASC`,
           [p.slug]
         );
-        if (!hist.length) continue;
 
         // Lê o valor atual e a data da última checagem da scrape_latest
         const { rows: latest } = await query(
@@ -604,14 +644,34 @@ app.get("/dashboard", async (_req, res) => {
 
         const latestRow = latest[0];
 
+        // FIX #4: antes, um item sem nenhuma linha em scrape_history ainda
+        // (ex: acabou de ser cadastrado, cron não rodou) era simplesmente
+        // ignorado e não aparecia na dashboard. Agora, com captureInicial()
+        // gravando em scrape_latest no momento do cadastro, o item já tem
+        // dado suficiente pra aparecer imediatamente.
+        const temDado = hist.length > 0 || !!latestRow;
+        if (!temDado) continue;
+
         ultimaLeitura[p.nome] = {
           ads:          latestRow ? latestRow.ads_count : hist[hist.length - 1].ads_count,
           url:          p.url,
           ultimaColeta: latestRow ? toBrDate(latestRow.collected_at).toISOString() : null,
         };
 
-        primeiraData[p.nome] = toBrDate(hist[0].collected_at).toISOString().slice(0, 10);
-        mon[p.nome] = { ini: hist[0].ads_count };
+        // FIX #4: Descoberta agora vem DIRETO de pages.created_at — a data
+        // real do cadastro no /admin — em vez de ser inferida da primeira
+        // linha de scrape_history (frágil: dependia do cron já ter rodado
+        // e podia se confundir com dados antigos de slugs reciclados).
+        primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
+
+        // FIX #4: Inicial vem do snapshot capturado no cadastro
+        // (pages.inicial_count). Fallback em cascata pra itens cadastrados
+        // ANTES dessa migração (inicial_count NULL): usa a 1ª linha do
+        // histórico do cron e, na ausência dela, o valor atual.
+        mon[p.nome] = {
+          ini: p.inicial_count ?? (hist.length ? hist[0].ads_count : (latestRow ? latestRow.ads_count : 0))
+        };
+
         paginas[p.nome] = {};
         for (const h of hist) {
           const brDt = toBrDate(h.collected_at);
