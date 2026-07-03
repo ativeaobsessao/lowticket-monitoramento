@@ -237,6 +237,103 @@ async function captureInicial(slug, url) {
   }
 }
 
+// FIX #5: versão de captureInicial que reaproveita um browser/context já
+// aberto (em vez de abrir e fechar um Chromium novo pra cada item, como o
+// captureInicial individual faz). Mesmo padrão de reuso que o runAllScrapes
+// já usa no cron — reduz bastante o tempo por item num lote.
+async function captureInicialWithContext(context, slug, url) {
+  let count = null;
+  for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
+    try {
+      count = await scrapeWithContext(context, url);
+    } catch (err) {
+      console.error(`[LOTE] slug=${slug} attempt=${attempt} error: ${err.message}`);
+    }
+  }
+  const final = count ?? 0;
+  await query(`UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`, [slug, final]);
+  await query(
+    `INSERT INTO scrape_latest (slug, ads_count, collected_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (slug) DO UPDATE SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+    [slug, final]
+  );
+  return final;
+}
+
+// FIX #5: processa o lote inteiro em segundo plano (fire-and-forget) — a
+// requisição HTTP que chamou isso já respondeu antes desta função rodar,
+// exatamente como o /api/coletar-tudo manual já faz hoje. Evita qualquer
+// timeout de proxy do Render em lotes grandes.
+// Compartilha o MESMO lock (isRunning) usado pelo cron — se o cron disparar
+// no meio de um lote (ou vice-versa), um dos dois espera o outro terminar,
+// nunca rodam dois Chromium ao mesmo tempo no plano free.
+async function runLote(itens) {
+  if (isRunning) {
+    console.warn("[LOTE] abortado — já existe uma coleta em andamento (cron ou outro lote)");
+    loteStatus.erros.push("Abortado: já havia uma coleta (cron ou outro lote) em andamento. Tente de novo em alguns minutos.");
+    loteStatus.emAndamento = false;
+    return;
+  }
+  isRunning = true;
+  loteStatus = {
+    emAndamento: true,
+    total: itens.length,
+    concluidos: 0,
+    atual: null,
+    erros: [],
+    iniciadoEm: new Date().toISOString(),
+    finalizadoEm: null,
+  };
+  console.log(`[LOTE] ===== iniciado — ${itens.length} itens =====`);
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      executablePath: getChromiumPath(),
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    });
+    const context = await browser.newContext({
+      locale: "pt-BR",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
+    });
+
+    for (const item of itens) {
+      loteStatus.atual = item.nome;
+      const slug = toSlug(item.nome);
+      if (!slug) {
+        loteStatus.erros.push(`"${item.nome}" — nome inválido, ignorado`);
+        loteStatus.concluidos++;
+        continue;
+      }
+      try {
+        await query(
+          `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4`,
+          [slug, item.nome, item.url, item.tipo]
+        );
+        await captureInicialWithContext(context, slug, item.url);
+        console.log(`[LOTE] slug=${slug} cadastrado e capturado (${loteStatus.concluidos + 1}/${itens.length})`);
+      } catch (err) {
+        console.error(`[LOTE] erro no item slug=${slug}: ${err.message}`);
+        loteStatus.erros.push(`"${item.nome}" — erro: ${err.message}`);
+      }
+      loteStatus.concluidos++;
+    }
+  } catch (err) {
+    console.error(`[LOTE] erro fatal: ${err.message}`);
+    loteStatus.erros.push(`Erro fatal: ${err.message}`);
+  } finally {
+    if (browser) await browser.close();
+    isRunning = false;
+    loteStatus.emAndamento = false;
+    loteStatus.atual = null;
+    loteStatus.finalizadoEm = new Date().toISOString();
+    console.log(`[LOTE] ===== finalizado — ${loteStatus.concluidos}/${loteStatus.total} processados, ${loteStatus.erros.length} erros =====`);
+  }
+}
+
 function resolveSlot(trigger) {
   switch (trigger) {
     case "cron-03h":
@@ -276,6 +373,53 @@ async function mirrorToSheet(rows) {
 // ─── Scheduled run: scrape ALL pages reusing one browser ────────────────────────
 
 let isRunning = false;
+
+// ─── FIX #5: Cadastro em lote ────────────────────────────────────────────────
+// Estado do lote fica só em memória (não precisa de tabela nova no banco —
+// é informação temporária, útil só enquanto o lote está rodando).
+let loteStatus = {
+  emAndamento: false,
+  total: 0,
+  concluidos: 0,
+  atual: null,
+  erros: [],
+  iniciadoEm: null,
+  finalizadoEm: null,
+};
+
+// Aceita linhas em 2 formatos:
+//   Nome | URL                  → tipo é auto-detectado pela própria URL
+//   tipo | Nome | URL           → tipo forçado manualmente (dominio/pagina)
+function parseLoteInput(texto) {
+  const linhas = texto.split("\n").map((l) => l.trim()).filter(Boolean);
+  const itens = [];
+  for (const linha of linhas) {
+    const partes = linha.split("|").map((s) => s.trim()).filter(Boolean);
+    let nome, url, tipoForcado = null;
+    if (partes.length >= 3) {
+      const possivelTipo = partes[0].toLowerCase();
+      if (possivelTipo === "dominio" || possivelTipo === "pagina") {
+        tipoForcado = possivelTipo;
+        nome = partes[1];
+        url = partes.slice(2).join("|");
+      } else {
+        nome = partes[0];
+        url = partes.slice(1).join("|");
+      }
+    } else if (partes.length === 2) {
+      nome = partes[0];
+      url = partes[1];
+    } else {
+      continue; // linha sem "|" ou vazia — ignora
+    }
+    if (!nome || !url) continue;
+    // Auto-detecção: URL de Biblioteca sempre tem view_all_page_id=,
+    // URL de Domínio sempre é busca por keyword (q=...).
+    const tipo = tipoForcado || (url.includes("view_all_page_id=") ? "pagina" : "dominio");
+    itens.push({ nome, url, tipo });
+  }
+  return itens;
+}
 
 async function runAllScrapes(trigger = "cron") {
   if (isRunning) {
@@ -544,6 +688,29 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 </div>
 
 <div class="card">
+  <h2>📦 Cadastro em lote</h2>
+  <form method="POST" action="/admin/lote">
+    <div class="field">
+      <label>Uma linha por item — formato: Nome | URL da Meta Ad Library</label>
+      <textarea name="itens" rows="6" placeholder="SYNTROHEALTH.SITE | https://www.facebook.com/ads/library/?q=%22SYNTROHEALTH.SITE%22...&#10;Protaflo Official | https://www.facebook.com/ads/library/?view_all_page_id=777074442148556" style="background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Mono',monospace;font-size:12px;padding:12px 14px;outline:none;resize:vertical;width:100%"></textarea>
+    </div>
+    <button type="submit" class="btn" style="margin-top:12px">Cadastrar lote</button>
+    <div class="tip">
+      💡 O tipo (Biblioteca ou Domínio) é detectado automaticamente pela URL — não precisa informar.<br>
+      Cada item leva ~15-20s pra processar. Recomendado: até 20 itens por lote no plano gratuito do Render.<br>
+      A página não precisa ficar aberta — o processamento continua em segundo plano no servidor.
+    </div>
+  </form>
+  <div id="lote-progresso" style="display:none;margin-top:16px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:14px 16px">
+    <div id="lote-texto" style="font-size:13px;color:var(--text2)"></div>
+    <div style="background:var(--border);border-radius:6px;height:8px;margin-top:10px;overflow:hidden">
+      <div id="lote-barra" style="background:var(--accent);height:100%;width:0%;transition:width .3s"></div>
+    </div>
+    <div id="lote-erros" style="font-size:12px;color:var(--down);margin-top:10px"></div>
+  </div>
+</div>
+
+<div class="card">
   <h2>📋 Rastreamentos cadastrados (${pages.length})</h2>
   ${pages.length === 0 ? '<div class="empty">Nenhum rastreamento cadastrado ainda.</div>' : `
   <table>
@@ -565,6 +732,48 @@ function atualizarDica(){
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&id=...';
   }
 }
+
+// FIX #5: acompanha o progresso do lote sem precisar recarregar a página.
+// Se a URL veio com ?lote=iniciado (redirect do POST /admin/lote), começa
+// a checar /api/lote/status a cada 3s até o lote terminar.
+(function iniciarPollingLote(){
+  const params = new URLSearchParams(window.location.search);
+  const painel = document.getElementById('lote-progresso');
+  const texto = document.getElementById('lote-texto');
+  const barra = document.getElementById('lote-barra');
+  const errosEl = document.getElementById('lote-erros');
+  if (!painel) return;
+
+  async function checarStatus(){
+    try {
+      const r = await fetch('/api/lote/status');
+      const s = await r.json();
+      if (!s.emAndamento && !s.total) return; // nenhum lote rodou ainda
+      painel.style.display = 'block';
+      const pct = s.total ? Math.round((s.concluidos / s.total) * 100) : 0;
+      barra.style.width = pct + '%';
+      if (s.emAndamento) {
+        texto.textContent = 'Processando ' + s.concluidos + ' de ' + s.total + '... atual: ' + (s.atual || '—');
+        setTimeout(checarStatus, 3000);
+      } else {
+        texto.textContent = 'Lote finalizado — ' + s.concluidos + ' de ' + s.total + ' itens processados.';
+        if (s.erros && s.erros.length) {
+          errosEl.innerHTML = s.erros.map(e => '⚠️ ' + e).join('<br>');
+        }
+      }
+    } catch (e) {
+      console.error('Falha ao consultar status do lote', e);
+    }
+  }
+
+  if (params.get('lote') === 'iniciado') {
+    checarStatus();
+  } else {
+    // Ao abrir a página normalmente, checa uma vez se sobrou algum lote
+    // em andamento (ex: você fechou a aba e voltou depois).
+    checarStatus();
+  }
+})();
 </script>
 </body>
 </html>`);
@@ -599,6 +808,24 @@ app.post("/admin/remover", async (req, res) => {
   await query("DELETE FROM pages WHERE slug=$1", [slug]);
   console.log(`[ADMIN] removeu slug=${slug}`);
   res.redirect("/admin?ok=removido");
+});
+
+// FIX #5: dispara o lote e responde IMEDIATAMENTE (padrão idêntico ao
+// /api/coletar-tudo) — quem está processando de verdade é a runLote() lá
+// atrás, rodando em segundo plano depois que o redirect já foi enviado.
+app.post("/admin/lote", async (req, res) => {
+  const { itens: textoItens } = req.body;
+  if (!textoItens || !textoItens.trim()) return res.redirect("/admin?erro=lote-vazio");
+  const itens = parseLoteInput(textoItens);
+  if (!itens.length) return res.redirect("/admin?erro=lote-invalido");
+  if (loteStatus.emAndamento) return res.redirect("/admin?erro=lote-em-andamento");
+  res.redirect("/admin?lote=iniciado");
+  runLote(itens).catch((err) => console.error("[LOTE] erro não tratado:", err.message));
+});
+
+// Consultado via polling pelo JS da página /admin enquanto o lote roda.
+app.get("/api/lote/status", (_req, res) => {
+  res.json(loteStatus);
 });
 
 app.get("/dashboard", async (_req, res) => {
