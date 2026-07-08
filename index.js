@@ -31,10 +31,14 @@ async function query(sql, params = []) {
 async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
-      slug        TEXT PRIMARY KEY,
-      nome        TEXT NOT NULL,
-      url         TEXT NOT NULL,
-      created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+      slug          TEXT PRIMARY KEY,
+      nome          TEXT NOT NULL,
+      url           TEXT NOT NULL,
+      tipo          TEXT NOT NULL DEFAULT 'pagina',
+      instagram_url TEXT,
+      geo           TEXT,
+      nicho         TEXT,
+      created_at    TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 
@@ -43,6 +47,7 @@ async function initDb() {
       id           SERIAL PRIMARY KEY,
       slug         TEXT NOT NULL,
       ads_count    INTEGER NOT NULL,
+      slot         SMALLINT,
       collected_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
@@ -51,8 +56,6 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_scrape_history_slug ON scrape_history(slug)
   `);
 
-  // Tabela para última leitura de cada slug (coleta manual e automática)
-  // Só guarda 1 linha por slug — sempre o valor mais recente
   await query(`
     CREATE TABLE IF NOT EXISTS scrape_latest (
       slug         TEXT PRIMARY KEY,
@@ -60,20 +63,13 @@ async function initDb() {
       collected_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
-  // Migração: adiciona coluna 'tipo' se ainda não existe.
-  // Registros antigos (sem tipo) viram 'pagina' automaticamente.
-  await query(`
-    ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'
-  `);
 
-  // FIX #4 — Migração: coluna que guarda o snapshot de ads_count capturado
-  // no EXATO momento do cadastro. Uma vez preenchida, nunca é sobrescrita —
-  // é o baseline imutável usado como "Inicial" na dashboard. Itens antigos
-  // (cadastrados antes dessa migração) ficam com NULL e o dashboard cai no
-  // fallback (primeira linha de scrape_history), preservando compatibilidade.
-  await query(`
-    ALTER TABLE pages ADD COLUMN IF NOT EXISTS inicial_count INTEGER
-  `);
+  // Migrações: garante colunas novas em banco antigo (seguro rodar sempre)
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS inicial_count INTEGER`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS instagram_url TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS geo TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
 
   console.log("[DB] Tables ready.");
 }
@@ -105,7 +101,7 @@ function getChromiumPath() {
   }
 }
 
-// ─── Scraper ──────────────────────────────────────────────────────────────────
+// ─── Scraper ─────────────────────────────────────────────────────────────────
 
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
@@ -171,13 +167,7 @@ async function scrapeAdCount(url, retries = 3) {
   return 0;
 }
 
-// ─── FIX #2: dedupe agora considera o slot, não só o slug ─────────────────────
-// Antes: qualquer insert em scrape_history nos últimos 60s (de QUALQUER slot,
-// inclusive slot=NULL vindo de coleta manual) bloqueava o insert seguinte,
-// mesmo que fosse o do cron com o slot certo. Isso podia "engolir" a gravação
-// legítima do cron caso colidisse no tempo com uma chamada manual.
-// Agora o dedupe só bloqueia duplicata do MESMO slot (slot NULL só bloqueia
-// contra outro slot NULL, via IS NOT DISTINCT FROM).
+// Dedupe considera slot — só bloqueia duplicata do MESMO slot
 async function saveCount(slug, count, slot) {
   console.log(`[SAVECOUNT] slug=${slug} slot=${slot}`);
   const { rows: recent } = await query(
@@ -189,11 +179,10 @@ async function saveCount(slug, count, slot) {
     [slug, slot]
   );
 
-  // Sempre atualiza o "atual" na scrape_latest (independente de duplicata)
   await query(
     `INSERT INTO scrape_latest (slug, ads_count, collected_at)
      VALUES ($1, $2, NOW())
-     ON CONFLICT (slug) DO UPDATE 
+     ON CONFLICT (slug) DO UPDATE
        SET ads_count    = EXCLUDED.ads_count,
            collected_at = EXCLUDED.collected_at`,
     [slug, count]
@@ -207,16 +196,10 @@ async function saveCount(slug, count, slot) {
   }
 }
 
-// ─── FIX #4: captura Descoberta+Inicial no exato momento do cadastro ─────────
-// Chamada logo após o INSERT em 'pages'. Faz UMA coleta síncrona da URL e:
-//   1. Grava em pages.inicial_count — só se ainda estiver NULL (COALESCE),
-//      pra nunca sobrescrever o baseline em caso de re-cadastro/edição.
-//   2. Atualiza scrape_latest, pra "Atual" já aparecer certo na dashboard.
-// NÃO grava em scrape_history — isso continua sendo território exclusivo
-// do cron, mantendo a regra do blueprint intacta.
+// Captura inicial no momento do cadastro (individual)
 async function captureInicial(slug, url) {
   try {
-    const count = await scrapeAdCount(url, 2); // 2 tentativas — não travar demais o form
+    const count = await scrapeAdCount(url, 2);
     await query(
       `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
       [slug, count]
@@ -224,7 +207,7 @@ async function captureInicial(slug, url) {
     await query(
       `INSERT INTO scrape_latest (slug, ads_count, collected_at)
        VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE 
+       ON CONFLICT (slug) DO UPDATE
          SET ads_count    = EXCLUDED.ads_count,
              collected_at = EXCLUDED.collected_at`,
       [slug, count]
@@ -237,10 +220,7 @@ async function captureInicial(slug, url) {
   }
 }
 
-// FIX #5: versão de captureInicial que reaproveita um browser/context já
-// aberto (em vez de abrir e fechar um Chromium novo pra cada item, como o
-// captureInicial individual faz). Mesmo padrão de reuso que o runAllScrapes
-// já usa no cron — reduz bastante o tempo por item num lote.
+// Versão de captureInicial que reutiliza browser já aberto (para lotes)
 async function captureInicialWithContext(context, slug, url) {
   let count = null;
   for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
@@ -260,13 +240,7 @@ async function captureInicialWithContext(context, slug, url) {
   return final;
 }
 
-// FIX #5: processa o lote inteiro em segundo plano (fire-and-forget) — a
-// requisição HTTP que chamou isso já respondeu antes desta função rodar,
-// exatamente como o /api/coletar-tudo manual já faz hoje. Evita qualquer
-// timeout de proxy do Render em lotes grandes.
-// Compartilha o MESMO lock (isRunning) usado pelo cron — se o cron disparar
-// no meio de um lote (ou vice-versa), um dos dois espera o outro terminar,
-// nunca rodam dois Chromium ao mesmo tempo no plano free.
+// Processa lote em background (fire-and-forget)
 async function runLote(itens) {
   if (isRunning) {
     console.warn("[LOTE] abortado — já existe uma coleta em andamento (cron ou outro lote)");
@@ -309,9 +283,11 @@ async function runLote(itens) {
       }
       try {
         await query(
-          `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
-           ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4`,
-          [slug, item.nome, item.url, item.tipo]
+          `INSERT INTO pages (slug, nome, url, tipo, instagram_url)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4,
+             instagram_url = COALESCE(EXCLUDED.instagram_url, pages.instagram_url)`,
+          [slug, item.nome, item.url, item.tipo, item.instagram_url || null]
         );
         await captureInicialWithContext(context, slug, item.url);
         console.log(`[LOTE] slug=${slug} cadastrado e capturado (${loteStatus.concluidos + 1}/${itens.length})`);
@@ -336,24 +312,12 @@ async function runLote(itens) {
 
 function resolveSlot(trigger) {
   switch (trigger) {
-    case "cron-03h":
-      return 3;
-
-    case "cron-12h":
-      return 12;
-
-    case "cron-22h":
-      return 22;
-
-    default:
-      return null;
+    case "cron-03h": return 3;
+    case "cron-12h": return 12;
+    case "cron-22h": return 22;
+    default: return null;
   }
 }
-
-
-// ─── Optional: mirror to Google Sheet (backup) ──────────────────────────────────
-// Set SHEET_WEBHOOK_URL env var to a Make.com/Apps Script webhook to keep the
-// spreadsheet alive as backup. If unset, this is silently skipped.
 
 async function mirrorToSheet(rows) {
   const url = process.env.SHEET_WEBHOOK_URL;
@@ -370,13 +334,8 @@ async function mirrorToSheet(rows) {
   }
 }
 
-// ─── Scheduled run: scrape ALL pages reusing one browser ────────────────────────
-
 let isRunning = false;
 
-// ─── FIX #5: Cadastro em lote ────────────────────────────────────────────────
-// Estado do lote fica só em memória (não precisa de tabela nova no banco —
-// é informação temporária, útil só enquanto o lote está rodando).
 let loteStatus = {
   emAndamento: false,
   total: 0,
@@ -387,36 +346,50 @@ let loteStatus = {
   finalizadoEm: null,
 };
 
-// Aceita linhas em 2 formatos:
-//   Nome | URL                  → tipo é auto-detectado pela própria URL
-//   tipo | Nome | URL           → tipo forçado manualmente (dominio/pagina)
+// Parser de lote — aceita 3 formatos:
+//   Nome | URL
+//   tipo | Nome | URL
+//   Nome | URL | https://instagram.com/...   (Instagram no final — opcional)
+//   tipo | Nome | URL | https://instagram.com/...
 function parseLoteInput(texto) {
   const linhas = texto.split("\n").map((l) => l.trim()).filter(Boolean);
   const itens = [];
   for (const linha of linhas) {
     const partes = linha.split("|").map((s) => s.trim()).filter(Boolean);
-    let nome, url, tipoForcado = null;
-    if (partes.length >= 3) {
+    let nome, url, tipoForcado = null, instagram_url = null;
+
+    if (partes.length >= 2) {
       const possivelTipo = partes[0].toLowerCase();
       if (possivelTipo === "dominio" || possivelTipo === "pagina") {
+        // tipo | Nome | URL [| Instagram]
         tipoForcado = possivelTipo;
         nome = partes[1];
-        url = partes.slice(2).join("|");
+        // Verifica se o último campo é uma URL do Instagram
+        const ultimo = partes[partes.length - 1];
+        if (partes.length >= 4 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
+          instagram_url = ultimo;
+          url = partes.slice(2, partes.length - 1).join("|");
+        } else {
+          url = partes.slice(2).join("|");
+        }
       } else {
+        // Nome | URL [| Instagram]
         nome = partes[0];
-        url = partes.slice(1).join("|");
+        const ultimo = partes[partes.length - 1];
+        if (partes.length >= 3 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
+          instagram_url = ultimo;
+          url = partes.slice(1, partes.length - 1).join("|");
+        } else {
+          url = partes.slice(1).join("|");
+        }
       }
-    } else if (partes.length === 2) {
-      nome = partes[0];
-      url = partes[1];
     } else {
       continue; // linha sem "|" ou vazia — ignora
     }
+
     if (!nome || !url) continue;
-    // Auto-detecção: URL de Biblioteca sempre tem view_all_page_id=,
-    // URL de Domínio sempre é busca por keyword (q=...).
     const tipo = tipoForcado || (url.includes("view_all_page_id=") ? "pagina" : "dominio");
-    itens.push({ nome, url, tipo });
+    itens.push({ nome, url, tipo, instagram_url });
   }
   return itens;
 }
@@ -461,25 +434,20 @@ async function runAllScrapes(trigger = "cron") {
       }
       const final = count ?? 0;
 
-    // Sempre atualiza scrape_latest (via saveCount)
-    // Só salva em scrape_history se for coleta automática do cron
-    if (trigger.startsWith('cron')) {
-      const slot = resolveSlot(trigger);
-      await saveCount(p.slug, final, slot);
-    } else
-
-      {
-      // Coleta manual: atualiza apenas o "atual" sem poluir o histórico
-      await query(
-        `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (slug) DO UPDATE 
-           SET ads_count    = EXCLUDED.ads_count,
-               collected_at = EXCLUDED.collected_at`,
-        [p.slug, final] // <-- Corrigido aqui de 'slug' para 'p.slug'
-      );
-      console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
-    }
+      if (trigger.startsWith("cron")) {
+        const slot = resolveSlot(trigger);
+        await saveCount(p.slug, final, slot);
+      } else {
+        await query(
+          `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (slug) DO UPDATE
+             SET ads_count    = EXCLUDED.ads_count,
+                 collected_at = EXCLUDED.collected_at`,
+          [p.slug, final]
+        );
+        console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
+      }
 
       results.push({ slug: p.slug, nome: p.nome, count: final });
     }
@@ -496,31 +464,31 @@ async function runAllScrapes(trigger = "cron") {
   return { pages: results.length, durationSec: secs, results };
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url, tipo } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho } = req.body;
   if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   await query(
-    `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
-     ON CONFLICT (slug) DO UPDATE SET nome = $2, url = $3, tipo = $4`,
-    [slug, nome, url, tipoFinal]
+    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (slug) DO UPDATE
+       SET nome=$2, url=$3, tipo=$4,
+           instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
+           geo=COALESCE(EXCLUDED.geo, pages.geo),
+           nicho=COALESCE(EXCLUDED.nicho, pages.nicho)`,
+    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null]
   );
   console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
-  const inicial = await captureInicial(slug, url); // FIX #4: grava Descoberta+Inicial na hora
+  const inicial = await captureInicial(slug, url);
   res.json({ slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${slug}` });
 });
 
-// ─── FIX #1: /api/coletar/:slug era uma segunda porta de entrada "manual" que
-// gravava direto em scrape_history com slot=NULL, violando a regra do
-// blueprint (só o cron escreve em scrape_history). Agora essa rota se
-// comporta exatamente como o /api/coletar-tudo manual: só atualiza
-// scrape_latest, nunca insere em scrape_history.
 app.get("/api/coletar/:slug", async (req, res) => {
   const { slug } = req.params;
   const { rows } = await query("SELECT * FROM pages WHERE slug = $1 LIMIT 1", [slug]);
@@ -529,11 +497,10 @@ app.get("/api/coletar/:slug", async (req, res) => {
   try {
     const count = await scrapeAdCount(row.url);
     res.type("text/plain").send(String(count));
-    // Coleta manual/pontual: atualiza apenas o "atual", nunca polui o histórico
     await query(
       `INSERT INTO scrape_latest (slug, ads_count, collected_at)
        VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE 
+       ON CONFLICT (slug) DO UPDATE
          SET ads_count    = EXCLUDED.ads_count,
              collected_at = EXCLUDED.collected_at`,
       [slug, count]
@@ -588,48 +555,75 @@ app.get("/api/status", async (_req, res) => {
 });
 
 app.get("/api/paginas", async (_req, res) => {
-  const { rows } = await query("SELECT slug, nome, url FROM pages");
+  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho FROM pages");
   res.json(rows);
 });
 
-// ─── Dashboard ────────────────────────────────────────────────────────────────
+// ─── Admin ───────────────────────────────────────────────────────────────────
 
 app.get("/admin", async (_req, res) => {
-  const { rows: pages } = await query("SELECT slug, nome, url, tipo, created_at FROM pages ORDER BY tipo, created_at DESC");
+  const { rows: pages } = await query(
+    "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, created_at FROM pages ORDER BY tipo, created_at DESC"
+  );
+
   const lista = pages.map(p => `
     <tr>
-      <td><span class="badge ${p.tipo==='dominio'?'b-dom':'b-pag'}">${p.tipo==='dominio'?'🌐 Domínio':'📡 Biblioteca'}</span></td>
-      <td class="nome">${p.nome}</td>
+      <td><span class="badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐 Domínio" : "📡 Biblioteca"}</span></td>
+      <td class="nome-cell">
+        <div class="nome">${p.nome}</div>
+        <div class="meta-badges">
+          ${p.geo ? `<span class="meta-tag">🌍 ${p.geo}</span>` : ""}
+          ${p.nicho ? `<span class="meta-tag">🏷️ ${p.nicho}</span>` : ""}
+          ${p.instagram_url ? `<a href="${p.instagram_url}" target="_blank" class="ig-tag">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:inline;vertical-align:middle;margin-right:3px"><rect width="24" height="24" rx="6" fill="url(#ig_admin)"/><circle cx="12" cy="12" r="4.5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="17" cy="7" r="1.2" fill="white"/><rect x="3" y="3" width="18" height="18" rx="5" stroke="white" stroke-width="1.8" fill="none"/><defs><linearGradient id="ig_admin" x1="0" y1="24" x2="24" y2="0"><stop offset="0%" stop-color="#f09433"/><stop offset="25%" stop-color="#e6683c"/><stop offset="50%" stop-color="#dc2743"/><stop offset="75%" stop-color="#cc2366"/><stop offset="100%" stop-color="#bc1888"/></linearGradient></defs></svg>Instagram</a>` : ""}
+        </div>
+      </td>
       <td><a href="${p.url}" target="_blank" class="url-link">Ver na Meta ↗</a></td>
-      <td>${new Date(p.created_at).toLocaleDateString('pt-BR')}</td>
+      <td>${new Date(p.created_at).toLocaleDateString("pt-BR")}</td>
       <td>
         <form method="POST" action="/admin/remover" onsubmit="return confirm('Remover ${p.nome}?')">
           <input type="hidden" name="slug" value="${p.slug}">
           <button type="submit" class="btn-del">Remover</button>
         </form>
       </td>
-    </tr>`).join('');
+    </tr>`).join("");
+
+  const msgOk = (() => {
+    const q = res.req?.query || {};
+    if (q.ok === "1") return '<div class="msg ok">✅ Rastreamento cadastrado com sucesso.</div>';
+    if (q.ok === "removido") return '<div class="msg ok">🗑️ Rastreamento removido.</div>';
+    if (q.erro === "campos-obrigatorios") return '<div class="msg err">⚠️ Nome e URL são obrigatórios.</div>';
+    if (q.erro === "nome-invalido") return '<div class="msg err">⚠️ Nome inválido.</div>';
+    if (q.erro === "lote-vazio") return '<div class="msg err">⚠️ Nenhum item enviado no lote.</div>';
+    if (q.erro === "lote-invalido") return '<div class="msg err">⚠️ Nenhuma linha válida encontrada no lote.</div>';
+    if (q.erro === "lote-em-andamento") return '<div class="msg err">⚠️ Já existe um lote em andamento. Aguarde terminar.</div>';
+    if (q.erro === "erro-interno") return '<div class="msg err">⚠️ Erro interno. Tente novamente.</div>';
+    return "";
+  })();
 
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VIVA Labs — Admin</title>
+<title>Lowticket Monitor — Admin</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:960px;margin:0 auto}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:1000px;margin:0 auto}
 .hdr{display:flex;align-items:center;gap:14px;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid var(--border)}
 .hdr h1{font-size:18px;font-weight:700}
 .hdr a{margin-left:auto;font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px}
 .hdr a:hover{background:var(--accent);color:#fff}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 24px;margin-bottom:20px}
 .card h2{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:18px}
-.form-grid{display:grid;grid-template-columns:1fr 2fr auto;gap:12px;align-items:end}
-@media(max-width:700px){.form-grid{grid-template-columns:1fr}}
+.form-row{display:grid;grid-template-columns:160px 1fr 1fr;gap:12px;align-items:end;margin-bottom:12px}
+.form-row-2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.form-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px}
+@media(max-width:700px){.form-row,.form-row-2,.form-row-3{grid-template-columns:1fr}}
 .field{display:flex;flex-direction:column;gap:6px}
 label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.label-optional{font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px;opacity:.7}
 input,select{background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:14px;padding:10px 14px;outline:none;transition:border-color .2s}
 input:focus,select:focus{border-color:var(--accent)}
 input::placeholder{color:var(--muted)}
@@ -642,6 +636,11 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:10px 14px;text-align:left;border-bottom:1px solid var(--border)}
 td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
 .nome{font-weight:600;color:#fff}
+.nome-cell{vertical-align:middle}
+.meta-badges{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
+.meta-tag{font-size:10px;background:rgba(124,111,255,.12);color:#a78bfa;padding:2px 7px;border-radius:5px;font-weight:500}
+.ig-tag{font-size:10px;background:rgba(220,39,67,.12);color:#fb7185;padding:2px 7px;border-radius:5px;font-weight:500;text-decoration:none;display:inline-flex;align-items:center;gap:3px}
+.ig-tag:hover{background:rgba(220,39,67,.25)}
 .url-link{color:var(--accent);font-size:12px;text-decoration:none;font-family:'Space Mono',monospace}
 .url-link:hover{text-decoration:underline}
 .badge{display:inline-block;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:600}
@@ -651,18 +650,21 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
 .msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px}
+.divider{border:none;border-top:1px solid var(--border);margin:16px 0}
 </style>
 </head>
 <body>
 <div class="hdr">
-  <h1>Painel Admin — Cadastro de Rastreamentos</h1>
+  <h1>⚙️ Admin — Lowticket Monitor</h1>
   <a href="/dashboard">← Ver Dashboard</a>
 </div>
+
+${msgOk}
 
 <div class="card">
   <h2>➕ Cadastrar novo rastreamento</h2>
   <form method="POST" action="/admin/salvar">
-    <div class="form-grid">
+    <div class="form-row">
       <div class="field">
         <label>Tipo</label>
         <select name="tipo" id="tipoSelect" onchange="atualizarDica()">
@@ -672,17 +674,37 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
       </div>
       <div class="field">
         <label>Nome</label>
-        <input type="text" name="nome" placeholder="Ex: Protaflo ou SYNTROHEALTH.SITE" required>
+        <input type="text" name="nome" placeholder="Ex: FlowForce Max ou FLOWFORCE.COM" required>
       </div>
-      <button type="submit" class="btn">Cadastrar</button>
+      <div class="field">
+        <label>URL da Meta Ad Library</label>
+        <input type="url" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
+      </div>
     </div>
-    <div class="field" style="margin-top:12px">
-      <label>URL da Meta Ad Library</label>
-      <input type="url" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
+
+    <hr class="divider">
+    <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">Informações adicionais <span style="font-weight:400;text-transform:none;letter-spacing:0;opacity:.6">(opcionais)</span></div>
+
+    <div class="form-row-3">
+      <div class="field">
+        <label>Instagram <span class="label-optional">opcional</span></label>
+        <input type="url" name="instagram_url" placeholder="https://www.instagram.com/perfil">
+      </div>
+      <div class="field">
+        <label>Geo <span class="label-optional">opcional</span></label>
+        <input type="text" name="geo" placeholder="Ex: US, BR, UK">
+      </div>
+      <div class="field">
+        <label>Nicho <span class="label-optional">opcional</span></label>
+        <input type="text" name="nicho" placeholder="Ex: Próstata, Weight Loss, ED">
+      </div>
     </div>
+
+    <button type="submit" class="btn" style="margin-top:4px">Cadastrar</button>
+
     <div class="tip" id="dica">
-      💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library.<br>
-      Exemplo: <code>https://www.facebook.com/ads/library/?id=XXXXXXXXX</code>
+      💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library com filtro "Anúncios ativos".<br>
+      Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>
     </div>
   </form>
 </div>
@@ -691,14 +713,20 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
   <h2>📦 Cadastro em lote</h2>
   <form method="POST" action="/admin/lote">
     <div class="field">
-      <label>Uma linha por item — formato: Nome | URL da Meta Ad Library</label>
-      <textarea name="itens" rows="6" placeholder="SYNTROHEALTH.SITE | https://www.facebook.com/ads/library/?q=%22SYNTROHEALTH.SITE%22...&#10;Protaflo Official | https://www.facebook.com/ads/library/?view_all_page_id=777074442148556" style="background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Mono',monospace;font-size:12px;padding:12px 14px;outline:none;resize:vertical;width:100%"></textarea>
+      <label>Uma linha por item</label>
+      <textarea name="itens" rows="7"
+        placeholder="FlowForce Max | https://www.facebook.com/ads/library/?view_all_page_id=123456 | https://instagram.com/flowforcemax&#10;FLOWFORCE.COM | https://www.facebook.com/ads/library/?q=FLOWFORCE.COM...&#10;dominio | AnotherOffer | https://www.facebook.com/ads/library/?q=ANOTHEROFFER.COM | https://instagram.com/anotheroffer"
+        style="background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Mono',monospace;font-size:12px;padding:12px 14px;outline:none;resize:vertical;width:100%"></textarea>
     </div>
     <button type="submit" class="btn" style="margin-top:12px">Cadastrar lote</button>
     <div class="tip">
-      💡 O tipo (Biblioteca ou Domínio) é detectado automaticamente pela URL — não precisa informar.<br>
-      Cada item leva ~15-20s pra processar. Recomendado: até 20 itens por lote no plano gratuito do Render.<br>
-      A página não precisa ficar aberta — o processamento continua em segundo plano no servidor.
+      💡 Formatos aceitos por linha:<br>
+      <code>Nome | URL da Meta Ad Library</code><br>
+      <code>Nome | URL da Meta Ad Library | https://instagram.com/perfil</code><br>
+      <code>tipo | Nome | URL | https://instagram.com/perfil</code><br><br>
+      O tipo (Biblioteca ou Domínio) é detectado automaticamente pela URL. O Instagram é opcional — basta omitir.<br>
+      Geo e Nicho só podem ser preenchidos após o cadastro, editando o item individualmente no admin.<br>
+      Cada item leva ~15-20s pra processar. A página não precisa ficar aberta.
     </div>
   </form>
   <div id="lote-progresso" style="display:none;margin-top:16px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:14px 16px">
@@ -714,7 +742,7 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
   <h2>📋 Rastreamentos cadastrados (${pages.length})</h2>
   ${pages.length === 0 ? '<div class="empty">Nenhum rastreamento cadastrado ainda.</div>' : `
   <table>
-    <thead><tr><th>Tipo</th><th>Nome</th><th>Link</th><th>Cadastrado</th><th></th></tr></thead>
+    <thead><tr><th>Tipo</th><th>Nome / Metadados</th><th>Link Meta</th><th>Cadastrado</th><th></th></tr></thead>
     <tbody>${lista}</tbody>
   </table>`}
 </div>
@@ -725,94 +753,81 @@ function atualizarDica(){
   const dica=document.getElementById('dica');
   const url=document.getElementById('urlInput');
   if(tipo==='dominio'){
-    dica.innerHTML='💡 <strong>Domínio:</strong> Cole a URL de busca por palavra-chave/domínio na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=SEUDOMINIO.COM&search_type=keyword_unordered</code>';
+    dica.innerHTML='💡 <strong>Domínio:</strong> Cole a URL de busca por palavra-chave/domínio na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM&search_type=keyword_unordered</code>';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM...';
   }else{
-    dica.innerHTML='💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>';
+    dica.innerHTML='💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library com filtro "Anúncios ativos".<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&id=...';
   }
 }
 
-// FIX #5: acompanha o progresso do lote sem precisar recarregar a página.
-// Se a URL veio com ?lote=iniciado (redirect do POST /admin/lote), começa
-// a checar /api/lote/status a cada 3s até o lote terminar.
 (function iniciarPollingLote(){
-  const params = new URLSearchParams(window.location.search);
-  const painel = document.getElementById('lote-progresso');
-  const texto = document.getElementById('lote-texto');
-  const barra = document.getElementById('lote-barra');
-  const errosEl = document.getElementById('lote-erros');
-  if (!painel) return;
-
+  const params=new URLSearchParams(window.location.search);
+  const painel=document.getElementById('lote-progresso');
+  const texto=document.getElementById('lote-texto');
+  const barra=document.getElementById('lote-barra');
+  const errosEl=document.getElementById('lote-erros');
+  if(!painel)return;
   async function checarStatus(){
-    try {
-      const r = await fetch('/api/lote/status');
-      const s = await r.json();
-      if (!s.emAndamento && !s.total) return; // nenhum lote rodou ainda
-      painel.style.display = 'block';
-      const pct = s.total ? Math.round((s.concluidos / s.total) * 100) : 0;
-      barra.style.width = pct + '%';
-      if (s.emAndamento) {
-        texto.textContent = 'Processando ' + s.concluidos + ' de ' + s.total + '... atual: ' + (s.atual || '—');
-        setTimeout(checarStatus, 3000);
-      } else {
-        texto.textContent = 'Lote finalizado — ' + s.concluidos + ' de ' + s.total + ' itens processados.';
-        if (s.erros && s.erros.length) {
-          errosEl.innerHTML = s.erros.map(e => '⚠️ ' + e).join('<br>');
-        }
+    try{
+      const r=await fetch('/api/lote/status');
+      const s=await r.json();
+      if(!s.emAndamento&&!s.total)return;
+      painel.style.display='block';
+      const pct=s.total?Math.round((s.concluidos/s.total)*100):0;
+      barra.style.width=pct+'%';
+      if(s.emAndamento){
+        texto.textContent='Processando '+s.concluidos+' de '+s.total+'... atual: '+(s.atual||'—');
+        setTimeout(checarStatus,3000);
+      }else{
+        texto.textContent='Lote finalizado — '+s.concluidos+' de '+s.total+' itens processados.';
+        if(s.erros&&s.erros.length){errosEl.innerHTML=s.erros.map(e=>'⚠️ '+e).join('<br>');}
       }
-    } catch (e) {
-      console.error('Falha ao consultar status do lote', e);
-    }
+    }catch(e){console.error('Falha ao consultar status do lote',e);}
   }
-
-  if (params.get('lote') === 'iniciado') {
-    checarStatus();
-  } else {
-    // Ao abrir a página normalmente, checa uma vez se sobrou algum lote
-    // em andamento (ex: você fechou a aba e voltou depois).
-    checarStatus();
-  }
+  if(params.get('lote')==='iniciado'){checarStatus();}else{checarStatus();}
 })();
 </script>
 </body>
 </html>`);
 });
 
-// Rota que processa o form de cadastro
 app.post("/admin/salvar", async (req, res) => {
-  const { nome, url, tipo } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho } = req.body;
   if (!nome || !url) return res.redirect("/admin?erro=campos-obrigatorios");
   const slug = toSlug(nome);
   if (!slug) return res.redirect("/admin?erro=nome-invalido");
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   try {
     await query(
-      `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4`,
-      [slug, nome, url, tipoFinal]
+      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (slug) DO UPDATE
+         SET nome=$2, url=$3, tipo=$4,
+             instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
+             geo=COALESCE(EXCLUDED.geo, pages.geo),
+             nicho=COALESCE(EXCLUDED.nicho, pages.nicho)`,
+      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null]
     );
     console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
-    await captureInicial(slug, url); // FIX #4: grava Descoberta+Inicial na hora (15-30s de espera)
+    await captureInicial(slug, url);
     res.redirect("/admin?ok=1");
-  } catch(err) {
+  } catch (err) {
     console.error("[ADMIN] erro:", err.message);
     res.redirect("/admin?erro=erro-interno");
   }
 });
 
-// Rota que processa remoção
 app.post("/admin/remover", async (req, res) => {
   const { slug } = req.body;
   if (!slug) return res.redirect("/admin");
   await query("DELETE FROM pages WHERE slug=$1", [slug]);
+  await query("DELETE FROM scrape_history WHERE slug=$1", [slug]);
+  await query("DELETE FROM scrape_latest WHERE slug=$1", [slug]);
   console.log(`[ADMIN] removeu slug=${slug}`);
   res.redirect("/admin?ok=removido");
 });
 
-// FIX #5: dispara o lote e responde IMEDIATAMENTE (padrão idêntico ao
-// /api/coletar-tudo) — quem está processando de verdade é a runLote() lá
-// atrás, rodando em segundo plano depois que o redirect já foi enviado.
 app.post("/admin/lote", async (req, res) => {
   const { itens: textoItens } = req.body;
   if (!textoItens || !textoItens.trim()) return res.redirect("/admin?erro=lote-vazio");
@@ -823,37 +838,32 @@ app.post("/admin/lote", async (req, res) => {
   runLote(itens).catch((err) => console.error("[LOTE] erro não tratado:", err.message));
 });
 
-// Consultado via polling pelo JS da página /admin enquanto o lote roda.
 app.get("/api/lote/status", (_req, res) => {
   res.json(loteStatus);
 });
 
+// ─── Dashboard ───────────────────────────────────────────────────────────────
+
+// SVG da logo do Instagram (inline, sem dependência externa)
+const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ig" x1="0" y1="24" x2="24" y2="0"><stop offset="0%" stop-color="#f09433"/><stop offset="25%" stop-color="#e6683c"/><stop offset="50%" stop-color="#dc2743"/><stop offset="75%" stop-color="#cc2366"/><stop offset="100%" stop-color="#bc1888"/></linearGradient></defs><rect width="24" height="24" rx="6" fill="url(#ig)"/><rect x="3" y="3" width="18" height="18" rx="5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="12" cy="12" r="4.5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="17.5" cy="6.5" r="1.2" fill="white"/></svg>`;
+
 app.get("/dashboard", async (_req, res) => {
   try {
-    const { rows: allPages } = await query("SELECT slug, nome, url, tipo, created_at, inicial_count FROM pages");
+    const { rows: allPages } = await query(
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho FROM pages"
+    );
 
-    // ─── FIX #3: conversão de fuso duplicada ──────────────────────────────
-    // As colunas collected_at são TIMESTAMP (sem timezone) e o valor gravado
-    // por NOW() já está em UTC "puro" (sessão do Postgres/Neon roda em UTC).
-    // O código antigo fazia `collected_at AT TIME ZONE 'America/Sao_Paulo'`,
-    // o que em Postgres NÃO converte de UTC pra BRT — ao contrário, assume
-    // que o valor já está em America/Sao_Paulo e devolve o instante UTC
-    // correspondente, deslocando o horário +3h além da conta. Isso fazia o
-    // fallback de slot (usado quando slot é NULL) "chutar" o horário errado.
-    // Fix: não usar AT TIME ZONE nenhum aqui — pega o timestamp cru (UTC) e
-    // subtrai 3h em JS pra obter o horário de Brasília.
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
     function toBrDate(utcNaiveTimestamp) {
       return new Date(new Date(utcNaiveTimestamp).getTime() - BR_OFFSET_MS);
     }
 
-    // Função que processa um conjunto de páginas e devolve os 2 pacotes de dados
-    // (dados gerais + dados da tabela histórica) para aquele grupo.
     async function processarGrupo(pagesDoGrupo) {
       const ultimaLeitura = {};
       const primeiraData = {};
       const paginas = {};
       const mon = {};
+      const meta = {}; // instagram_url, geo, nicho por nome
 
       for (const p of pagesDoGrupo) {
         const { rows: hist } = await query(
@@ -862,20 +872,12 @@ app.get("/dashboard", async (_req, res) => {
           [p.slug]
         );
 
-        // Lê o valor atual e a data da última checagem da scrape_latest
         const { rows: latest } = await query(
-          `SELECT ads_count, collected_at
-           FROM scrape_latest WHERE slug = $1 LIMIT 1`,
+          `SELECT ads_count, collected_at FROM scrape_latest WHERE slug = $1 LIMIT 1`,
           [p.slug]
         );
 
         const latestRow = latest[0];
-
-        // FIX #4: antes, um item sem nenhuma linha em scrape_history ainda
-        // (ex: acabou de ser cadastrado, cron não rodou) era simplesmente
-        // ignorado e não aparecia na dashboard. Agora, com captureInicial()
-        // gravando em scrape_latest no momento do cadastro, o item já tem
-        // dado suficiente pra aparecer imediatamente.
         const temDado = hist.length > 0 || !!latestRow;
         if (!temDado) continue;
 
@@ -885,25 +887,23 @@ app.get("/dashboard", async (_req, res) => {
           ultimaColeta: latestRow ? toBrDate(latestRow.collected_at).toISOString() : null,
         };
 
-        // FIX #4: Descoberta agora vem DIRETO de pages.created_at — a data
-        // real do cadastro no /admin — em vez de ser inferida da primeira
-        // linha de scrape_history (frágil: dependia do cron já ter rodado
-        // e podia se confundir com dados antigos de slugs reciclados).
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
 
-        // FIX #4: Inicial vem do snapshot capturado no cadastro
-        // (pages.inicial_count). Fallback em cascata pra itens cadastrados
-        // ANTES dessa migração (inicial_count NULL): usa a 1ª linha do
-        // histórico do cron e, na ausência dela, o valor atual.
         mon[p.nome] = {
           ini: p.inicial_count ?? (hist.length ? hist[0].ads_count : (latestRow ? latestRow.ads_count : 0))
+        };
+
+        // Metadados para a dashboard
+        meta[p.nome] = {
+          instagram_url: p.instagram_url || null,
+          geo:           p.geo || null,
+          nicho:         p.nicho || null,
         };
 
         paginas[p.nome] = {};
         for (const h of hist) {
           const brDt = toBrDate(h.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
-          // Novo sistema: usa h.slot direto. Fallback por hora para registros antigos (slot null)
           const slot = (h.slot !== null && h.slot !== undefined)
             ? Number(h.slot)
             : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
@@ -912,7 +912,6 @@ app.get("/dashboard", async (_req, res) => {
         }
       }
 
-      // Tabela histórica do grupo
       const slugs = pagesDoGrupo.map(p => p.slug);
       let histMap = {}, histDates = [];
       if (slugs.length) {
@@ -927,7 +926,6 @@ app.get("/dashboard", async (_req, res) => {
           const nome = r.nome;
           const brDt = toBrDate(r.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
-          // Novo sistema: usa r.slot direto. Fallback por hora para registros antigos (slot null)
           const slot = (r.slot !== null && r.slot !== undefined)
             ? Number(r.slot)
             : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
@@ -941,26 +939,29 @@ app.get("/dashboard", async (_req, res) => {
       const histLibs = Object.keys(paginas).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
 
       return {
-        geral: { pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon },
-        hist: { map: histMap, dates: histDates, libs: histLibs },
+        geral: { pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon, meta },
+        hist:  { map: histMap, dates: histDates, libs: histLibs },
         count: Object.keys(paginas).length,
       };
     }
 
-    const grupoPaginas = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
+    const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
 
-    const dados = JSON.stringify(grupoPaginas.geral);
-    const histDados = JSON.stringify(grupoPaginas.hist);
-    const dadosDom = JSON.stringify(grupoDominios.geral);
+    const dados       = JSON.stringify(grupoPaginas.geral);
+    const histDados   = JSON.stringify(grupoPaginas.hist);
+    const dadosDom    = JSON.stringify(grupoDominios.geral);
     const histDadosDom = JSON.stringify(grupoDominios.hist);
+
+    // Serializa o SVG do Instagram para uso seguro dentro do template literal JS
+    const IG_SVG_ESC = IG_SVG.replace(/`/g, "\\`").replace(/\$/g, "\\$");
 
     res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VIVA Labs — Monitor</title>
+<title>Lowticket Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
@@ -976,7 +977,6 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .section-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:0 0 12px 2px;display:flex;align-items:center;gap:8px}
 .scaling-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:26px}
 .scale-card{background:linear-gradient(135deg,#1a1530,#14122a);border:1px solid #2e2658;border-radius:14px;padding:16px 18px;position:relative;overflow:hidden}
-.scale-card.is-cut{background:linear-gradient(135deg,#2a1520,#231220);border-color:#4a2435}
 .scale-card-rank{position:absolute;top:12px;right:14px;font-size:11px;color:var(--muted);font-family:'Space Mono',monospace}
 .scale-card-name{font-size:13px;font-weight:600;color:#fff;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:24px}
 .scale-card-val{font-size:30px;font-weight:700;color:#fff;font-family:'Space Mono',monospace;line-height:1}
@@ -986,7 +986,6 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .empty-hint{background:var(--surface);border:1px dashed var(--border);border-radius:12px;padding:22px;text-align:center;color:var(--muted);font-size:13px;margin-bottom:26px}
 .lib-link{color:var(--text);text-decoration:none;border-bottom:1px solid var(--border);padding-bottom:1px;transition:color .15s,border-color .15s}
 .lib-link:hover{color:var(--accent);border-color:var(--accent)}
-
 .accordion-wrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
 .accordion-btn{width:100%;display:flex;align-items:center;gap:10px;padding:14px 18px;background:transparent;border:none;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;cursor:pointer;text-align:left;transition:background .15s}
 .accordion-btn:hover{background:var(--surface2)}
@@ -1013,7 +1012,11 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{background:var(--surface2);color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:11px 16px;text-align:left;font-weight:600}
 td{padding:11px 16px;border-top:1px solid var(--border);color:var(--text2);white-space:nowrap}
 tbody tr:hover td{background:var(--surface2)}
-.t-name{font-weight:600;color:#fff}
+.t-name{font-weight:600;color:#fff;white-space:normal}
+.t-name-main{display:block;font-weight:600;color:#fff;margin-bottom:4px}
+.t-meta-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
+.t-geo-badge{font-size:10px;background:rgba(34,211,238,.1);color:#22d3ee;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
+.t-nicho-badge{font-size:10px;background:rgba(167,139,250,.12);color:#a78bfa;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:7px;font-size:11px;font-weight:600;font-family:'Space Grotesk'}
 .b-up{background:rgba(52,211,153,.13);color:#34d399}
 .b-hot{background:rgba(167,139,250,.15);color:#a78bfa}
@@ -1023,8 +1026,11 @@ tbody tr:hover td{background:var(--surface2)}
 .scalebar-bg{width:80px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-right:8px}
 .scalebar{height:5px;border-radius:3px;display:block}
 .spark3{font-family:'Space Mono',monospace;font-size:13px}
-@media(max-width:1100px){.grid-charts{grid-template-columns:1fr}.rosca-wrap{flex-direction:column}}
-
+.ig-cell{text-align:center}
+.ig-link{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;transition:background .15s}
+.ig-link:hover{background:rgba(220,39,67,.15)}
+.ig-none{color:var(--muted);font-size:13px}
+.mono{font-family:'Space Mono',monospace}
 .hist-tbl thead th{white-space:nowrap}
 .hist-tbl td{font-family:'Space Mono',monospace;font-size:12px;text-align:center}
 .hist-tbl td.lib-name{text-align:left;font-family:'Space Grotesk',sans-serif;font-weight:600;color:#fff;white-space:nowrap}
@@ -1032,7 +1038,8 @@ tbody tr:hover td{background:var(--surface2)}
 .hist-slot{display:inline-block;min-width:42px;text-align:right}
 .hist-slot.empty{color:var(--border)}
 .tbl-scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch}
-
+.group-title{font-size:15px;font-weight:700;color:#fff;letter-spacing:.4px;margin:0 0 16px 2px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+@media(max-width:1100px){.grid-charts{grid-template-columns:1fr}.rosca-wrap{flex-direction:column}}
 @media(max-width:768px){
   body{padding:12px}
   .hdr{flex-wrap:wrap;gap:8px}
@@ -1046,51 +1053,22 @@ tbody tr:hover td{background:var(--surface2)}
   .rosca-wrap{flex-direction:column;align-items:flex-start}
   .rosca-canvas{width:120px;height:120px}
   .hist-box{height:220px}
-
   .tbl-panel table thead{display:none}
-  .tbl-panel table tbody tr{
-    display:block;
-    background:var(--surface2);
-    border:1px solid var(--border);
-    border-radius:10px;
-    margin-bottom:10px;
-    padding:12px 14px;
-  }
-  .tbl-panel table tbody td{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    padding:5px 0;
-    border-top:none;
-    white-space:normal;
-    font-size:12px;
-  }
-  .tbl-panel table tbody td::before{
-    content:attr(data-label);
-    font-size:10px;
-    font-weight:600;
-    color:var(--muted);
-    text-transform:uppercase;
-    letter-spacing:.5px;
-    margin-right:10px;
-    flex-shrink:0;
-  }
+  .tbl-panel table tbody tr{display:block;background:var(--surface2);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;padding:12px 14px}
+  .tbl-panel table tbody td{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-top:none;white-space:normal;font-size:12px}
+  .tbl-panel table tbody td::before{content:attr(data-label);font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-right:10px;flex-shrink:0}
   .tbl-panel table tbody td.t-name{font-size:14px;font-weight:700;color:#fff;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px}
   .tbl-panel table tbody td.t-name::before{display:none}
   .scalebar-bg{width:50px}
 }
-
-@media(max-width:480px){
-  .scaling-strip{grid-template-columns:1fr}
-}
-.group-title{font-size:15px;font-weight:700;color:#fff;letter-spacing:.4px;margin:0 0 16px 2px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+@media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 
 <div class="hdr">
   <div>
-    <h1>Monitor de Bibliotecas</h1>
+    <h1>📊 Lowticket Monitor</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
@@ -1124,7 +1102,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
   </table>
@@ -1157,7 +1135,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Bibliotecas</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
   </table>
@@ -1173,9 +1151,7 @@ tbody tr:hover td{background:var(--surface2)}
     <span class="acc-meta" id="dom_acc-meta"></span>
     <span class="acc-icon" id="dom_acc-icon">▼</span>
   </button>
-  <div class="accordion-body" id="dom_hist-section">
-    Carregando histórico...
-  </div>
+  <div class="accordion-body" id="dom_hist-section">Carregando histórico...</div>
 </div>
 
 <div class="accordion-wrap" style="margin-top:12px">
@@ -1184,15 +1160,15 @@ tbody tr:hover td{background:var(--surface2)}
     <span class="acc-meta" id="pag_acc-meta"></span>
     <span class="acc-icon" id="pag_acc-icon">▼</span>
   </button>
-  <div class="accordion-body" id="pag_hist-section">
-    Carregando histórico...
-  </div>
+  <div class="accordion-body" id="pag_hist-section">Carregando histórico...</div>
 </div>
 
 <script>
+const IG_SVG=\`${IG_SVG_ESC}\`;
+
 document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  coletas 03h · 12h · 22h";
 
-function toggleAccordion(bodyId, iconId){
+function toggleAccordion(bodyId,iconId){
   const body=document.getElementById(bodyId);
   const icon=document.getElementById(iconId);
   body.classList.toggle('open');
@@ -1204,12 +1180,10 @@ const COR=["#7c6fff","#34d399","#fb7185","#fbbf24","#22d3ee","#a78bfa","#f97316"
 function med(s){const v=Object.values(s).filter(x=>!isNaN(x));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null}
 function fd(dk){const[y,m,d]=dk.split("-");return d+"/"+m}
 function fdFull(dk){const[y,m,d]=dk.split("-");return d+"/"+m+"/"+y}
-const{pags,ultima,primeira,mon}=D;
+const{pags,ultima,primeira,mon,meta}=D;
 const LP=Object.keys(pags).sort();
 const dSet=new Set();LP.forEach(p=>Object.keys(pags[p]).forEach(d=>dSet.add(d)));
 const datas=Array.from(dSet).sort();
-const ult=datas[datas.length-1];
-
 
 function serie(pag){return datas.map(dk=>pags[pag]?.[dk]?med(pags[pag][dk]):null)}
 function slope(pag){
@@ -1268,19 +1242,34 @@ porAds.forEach((pag,idx)=>{
   const spark3=last3.length>=2?(last3[last3.length-1]>last3[0]?'<span style="color:#34d399">▲ sub</span>':last3[last3.length-1]<last3[0]?'<span style="color:#fb7185">▼ cai</span>':'<span style="color:#888">= est</span>'):"—";
   const partPct=Math.round((x.at/maxAds)*100);
   const corLib=COR[idx%COR.length];
+
+  // Monta célula do nome com badges de geo e nicho
+  const m=meta?.[pag]||{};
+  const geoBadge=m.geo?'<span class="t-geo-badge">🌍 '+m.geo+'</span>':'';
+  const nichoBadge=m.nicho?'<span class="t-nicho-badge">🏷️ '+m.nicho+'</span>':'';
+  const metaBadgesHtml=(geoBadge||nichoBadge)?'<div class="t-meta-badges">'+geoBadge+nichoBadge+'</div>':'';
+  const nomeCell='<span class="t-name-main"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></span>'+metaBadgesHtml;
+
+  // Célula do Instagram
+  const igCell=m.instagram_url
+    ?'<a href="'+m.instagram_url+'" target="_blank" rel="noopener" class="ig-link" title="Ver Instagram">'+IG_SVG+'</a>'
+    :'<span class="ig-none">—</span>';
+
   const tr=document.createElement("tr");
-  tr.innerHTML='<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
-  +'<td class="t-name"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></td>'
-  +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
-  +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
-  +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
-  +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
-  +(ultima[pag]?.ultimaColeta ? new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—')
-  +'</td>'
-  +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
-  +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
-  +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
-  +'<td class="spark3" data-label="3 dias">'+spark3+'</td>';
+  tr.innerHTML=
+    '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
+    +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
+    +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
+    +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
+    +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
+    +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
+    +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
+    +'</td>'
+    +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
+    +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
+    +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
+    +'<td class="spark3" data-label="3 dias">'+spark3+'</td>'
+    +'<td class="ig-cell" data-label="Instagram">'+igCell+'</td>';
   tbody.appendChild(tr);
 });
 
@@ -1361,7 +1350,7 @@ if(!HD.dates.length||!HD.libs.length){
   tbody2+='</tbody>';
   histSection.innerHTML='<div class="tbl-scroll-x"><table class="hist-tbl">'+thead+tbody2+'</table></div>';
   const metaEl=document.getElementById(P+"acc-meta");
-  if(metaEl) metaEl.textContent='('+rowCount+' registros)';
+  if(metaEl)metaEl.textContent='('+rowCount+' registros)';
 }
 }
 
@@ -1388,9 +1377,9 @@ render(D_PAG,HD_PAG,"pag_");
   }
 });
 
-// ─── Scheduler (internal cron — replaces Make.com) ──────────────────────────────
+// ─── Scheduler ───────────────────────────────────────────────────────────────
 
-// Cron em UTC explicito: 03h BR=06h UTC | 12h BR=15h UTC | 22h BR=01h UTC
+// Cron em UTC explícito: 03h BR=06h UTC | 12h BR=15h UTC | 22h BR=01h UTC
 cron.schedule("0 6 * * *",  () => runAllScrapes("cron-03h"), { timezone: "UTC" });
 cron.schedule("0 15 * * *", () => runAllScrapes("cron-12h"), { timezone: "UTC" });
 cron.schedule("0 1 * * *",  () => runAllScrapes("cron-22h"), { timezone: "UTC" });
