@@ -70,6 +70,27 @@ async function initDb() {
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS instagram_url TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS geo TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS funil TEXT`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS funnels (
+      id         SERIAL PRIMARY KEY,
+      slug       TEXT NOT NULL REFERENCES pages(slug) ON DELETE CASCADE,
+      nome       TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS funnel_steps (
+      id         SERIAL PRIMARY KEY,
+      funnel_id  INTEGER NOT NULL REFERENCES funnels(id) ON DELETE CASCADE,
+      ordem      SMALLINT NOT NULL,
+      nome_etapa TEXT NOT NULL,
+      url        TEXT NOT NULL
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_funnels_slug ON funnels(slug)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_funnel_steps_funnel_id ON funnel_steps(funnel_id)`);
 
   console.log("[DB] Tables ready.");
 }
@@ -469,20 +490,21 @@ async function runAllScrapes(trigger = "cron") {
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho, funil } = req.body;
   if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   await query(
-    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (slug) DO UPDATE
        SET nome=$2, url=$3, tipo=$4,
            instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
            geo=COALESCE(EXCLUDED.geo, pages.geo),
-           nicho=COALESCE(EXCLUDED.nicho, pages.nicho)`,
-    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null]
+           nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
+           funil=COALESCE(EXCLUDED.funil, pages.funil)`,
+    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
   );
   console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
   const inicial = await captureInicial(slug, url);
@@ -555,7 +577,7 @@ app.get("/api/status", async (_req, res) => {
 });
 
 app.get("/api/paginas", async (_req, res) => {
-  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho FROM pages");
+  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil FROM pages");
   res.json(rows);
 });
 
@@ -563,8 +585,13 @@ app.get("/api/paginas", async (_req, res) => {
 
 app.get("/admin", async (_req, res) => {
   const { rows: pages } = await query(
-    "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, created_at FROM pages ORDER BY tipo, created_at DESC"
+    "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil, created_at FROM pages ORDER BY tipo, created_at DESC"
   );
+
+  // JSON de cada item, embutido no atributo data-item, usado pelo JS para preencher o formulário ao clicar em Editar
+  function escAttr(str) {
+    return String(str ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
 
   const lista = pages.map(p => `
     <tr>
@@ -574,14 +601,26 @@ app.get("/admin", async (_req, res) => {
         <div class="meta-badges">
           ${p.geo ? `<span class="meta-tag">🌍 ${p.geo}</span>` : ""}
           ${p.nicho ? `<span class="meta-tag">🏷️ ${p.nicho}</span>` : ""}
+          ${p.funil ? `<span class="meta-tag">🎯 ${p.funil}</span>` : ""}
           ${p.instagram_url ? `<a href="${p.instagram_url}" target="_blank" class="ig-tag">
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:inline;vertical-align:middle;margin-right:3px"><rect width="24" height="24" rx="6" fill="url(#ig_admin)"/><circle cx="12" cy="12" r="4.5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="17" cy="7" r="1.2" fill="white"/><rect x="3" y="3" width="18" height="18" rx="5" stroke="white" stroke-width="1.8" fill="none"/><defs><linearGradient id="ig_admin" x1="0" y1="24" x2="24" y2="0"><stop offset="0%" stop-color="#f09433"/><stop offset="25%" stop-color="#e6683c"/><stop offset="50%" stop-color="#dc2743"/><stop offset="75%" stop-color="#cc2366"/><stop offset="100%" stop-color="#bc1888"/></linearGradient></defs></svg>Instagram</a>` : ""}
         </div>
       </td>
       <td><a href="${p.url}" target="_blank" class="url-link">Ver na Meta ↗</a></td>
       <td>${new Date(p.created_at).toLocaleDateString("pt-BR")}</td>
-      <td>
-        <form method="POST" action="/admin/remover" onsubmit="return confirm('Remover ${p.nome}?')">
+      <td style="white-space:nowrap">
+        <button type="button" class="btn-edit"
+          data-slug="${escAttr(p.slug)}"
+          data-nome="${escAttr(p.nome)}"
+          data-url="${escAttr(p.url)}"
+          data-tipo="${escAttr(p.tipo)}"
+          data-instagram="${escAttr(p.instagram_url)}"
+          data-geo="${escAttr(p.geo)}"
+          data-nicho="${escAttr(p.nicho)}"
+          data-funil="${escAttr(p.funil)}"
+          onclick="editarItem(this)">✏️ Editar</button>
+        <a href="/admin/funis/${p.slug}" class="btn-funis">🔀 Funis</a>
+        <form method="POST" action="/admin/remover" style="display:inline" onsubmit="return confirm('Remover ${p.nome}?')">
           <input type="hidden" name="slug" value="${p.slug}">
           <button type="submit" class="btn-del">Remover</button>
         </form>
@@ -591,6 +630,7 @@ app.get("/admin", async (_req, res) => {
   const msgOk = (() => {
     const q = res.req?.query || {};
     if (q.ok === "1") return '<div class="msg ok">✅ Rastreamento cadastrado com sucesso.</div>';
+    if (q.ok === "editado") return '<div class="msg ok">✏️ Rastreamento atualizado com sucesso.</div>';
     if (q.ok === "removido") return '<div class="msg ok">🗑️ Rastreamento removido.</div>';
     if (q.erro === "campos-obrigatorios") return '<div class="msg err">⚠️ Nome e URL são obrigatórios.</div>';
     if (q.erro === "nome-invalido") return '<div class="msg err">⚠️ Nome inválido.</div>';
@@ -629,7 +669,11 @@ input:focus,select:focus{border-color:var(--accent)}
 input::placeholder{color:var(--muted)}
 .btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;padding:10px 22px;cursor:pointer;transition:opacity .2s}
 .btn:hover{opacity:.85}
-.btn-del{background:transparent;color:var(--down);border:1px solid var(--down);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s}
+.btn-del{background:transparent;color:var(--down);border:1px solid var(--down);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s;margin-left:6px}
+.btn-edit{background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s}
+.btn-edit:hover{background:var(--accent);color:#fff}
+.btn-funis{display:inline-block;background:transparent;color:#34d399;border:1px solid #34d399;border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s;text-decoration:none;margin-left:6px}
+.btn-funis:hover{background:#34d399;color:#0a0a14}
 .btn-del:hover{background:var(--down);color:#fff}
 .tip{font-size:12px;color:var(--muted);margin-top:14px;line-height:1.6;background:#0f0f1e;border-radius:8px;padding:12px 14px;border-left:3px solid var(--accent)}
 table{width:100%;border-collapse:collapse;font-size:13px}
@@ -661,9 +705,10 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 
 ${msgOk}
 
-<div class="card">
-  <h2>➕ Cadastrar novo rastreamento</h2>
-  <form method="POST" action="/admin/salvar">
+<div class="card" id="form-card">
+  <h2 id="form-title">➕ Cadastrar novo rastreamento</h2>
+  <form method="POST" action="/admin/salvar" id="mainForm">
+    <input type="hidden" name="original_slug" id="originalSlug" value="">
     <div class="form-row">
       <div class="field">
         <label>Tipo</label>
@@ -674,7 +719,7 @@ ${msgOk}
       </div>
       <div class="field">
         <label>Nome</label>
-        <input type="text" name="nome" placeholder="Ex: FlowForce Max ou FLOWFORCE.COM" required>
+        <input type="text" name="nome" id="nomeInput" placeholder="Ex: FlowForce Max ou FLOWFORCE.COM" required>
       </div>
       <div class="field">
         <label>URL da Meta Ad Library</label>
@@ -688,19 +733,28 @@ ${msgOk}
     <div class="form-row-3">
       <div class="field">
         <label>Instagram <span class="label-optional">opcional</span></label>
-        <input type="url" name="instagram_url" placeholder="https://www.instagram.com/perfil">
+        <input type="url" name="instagram_url" id="instagramInput" placeholder="https://www.instagram.com/perfil">
       </div>
       <div class="field">
         <label>Geo <span class="label-optional">opcional</span></label>
-        <input type="text" name="geo" placeholder="Ex: US, BR, UK">
+        <input type="text" name="geo" id="geoInput" placeholder="Ex: US, BR, UK">
       </div>
       <div class="field">
         <label>Nicho <span class="label-optional">opcional</span></label>
-        <input type="text" name="nicho" placeholder="Ex: Próstata, Weight Loss, ED">
+        <input type="text" name="nicho" id="nichoInput" placeholder="Ex: Próstata, Weight Loss, ED">
+      </div>
+    </div>
+    <div class="form-row-3">
+      <div class="field">
+        <label>Funil <span class="label-optional">opcional</span></label>
+        <input type="text" name="funil" id="funilInput" placeholder="Ex: VSL, Advertorial, Quiz">
       </div>
     </div>
 
-    <button type="submit" class="btn" style="margin-top:4px">Cadastrar</button>
+    <div style="display:flex;gap:10px;margin-top:4px">
+      <button type="submit" class="btn" id="submitBtn">Cadastrar</button>
+      <button type="button" class="btn" id="cancelBtn" style="display:none;background:transparent;border:1px solid var(--border);color:var(--text2)" onclick="cancelarEdicao()">Cancelar edição</button>
+    </div>
 
     <div class="tip" id="dica">
       💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library com filtro "Anúncios ativos".<br>
@@ -761,6 +815,31 @@ function atualizarDica(){
   }
 }
 
+function editarItem(btn){
+  document.getElementById('originalSlug').value=btn.dataset.slug;
+  document.getElementById('nomeInput').value=btn.dataset.nome;
+  document.getElementById('urlInput').value=btn.dataset.url;
+  document.getElementById('tipoSelect').value=btn.dataset.tipo;
+  document.getElementById('instagramInput').value=btn.dataset.instagram;
+  document.getElementById('geoInput').value=btn.dataset.geo;
+  document.getElementById('nichoInput').value=btn.dataset.nicho;
+  document.getElementById('funilInput').value=btn.dataset.funil;
+  document.getElementById('form-title').textContent='✏️ Editando: '+btn.dataset.nome;
+  document.getElementById('submitBtn').textContent='Salvar alterações';
+  document.getElementById('cancelBtn').style.display='inline-block';
+  atualizarDica();
+  document.getElementById('form-card').scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+function cancelarEdicao(){
+  document.getElementById('mainForm').reset();
+  document.getElementById('originalSlug').value='';
+  document.getElementById('form-title').textContent='➕ Cadastrar novo rastreamento';
+  document.getElementById('submitBtn').textContent='Cadastrar';
+  document.getElementById('cancelBtn').style.display='none';
+  atualizarDica();
+}
+
 (function iniciarPollingLote(){
   const params=new URLSearchParams(window.location.search);
   const painel=document.getElementById('lote-progresso');
@@ -793,21 +872,44 @@ function atualizarDica(){
 });
 
 app.post("/admin/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
   if (!nome || !url) return res.redirect("/admin?erro=campos-obrigatorios");
+  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+
+  // Modo edição: atualiza o registro existente pelo slug original — o slug NUNCA muda,
+  // mesmo que o nome de exibição mude, para preservar o vínculo com scrape_history/scrape_latest.
+  if (original_slug && original_slug.trim()) {
+    try {
+      const { rowCount } = await query(
+        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7 WHERE slug=$8`,
+        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, original_slug.trim()]
+      );
+      if (rowCount === 0) {
+        console.warn(`[ADMIN] edição falhou — slug=${original_slug} não encontrado`);
+        return res.redirect("/admin?erro=erro-interno");
+      }
+      console.log(`[ADMIN] editou slug=${original_slug}`);
+      return res.redirect("/admin?ok=editado");
+    } catch (err) {
+      console.error("[ADMIN] erro ao editar:", err.message);
+      return res.redirect("/admin?erro=erro-interno");
+    }
+  }
+
+  // Modo cadastro (novo item)
   const slug = toSlug(nome);
   if (!slug) return res.redirect("/admin?erro=nome-invalido");
-  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   try {
     await query(
-      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (slug) DO UPDATE
          SET nome=$2, url=$3, tipo=$4,
              instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
              geo=COALESCE(EXCLUDED.geo, pages.geo),
-             nicho=COALESCE(EXCLUDED.nicho, pages.nicho)`,
-      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null]
+             nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
+             funil=COALESCE(EXCLUDED.funil, pages.funil)`,
+      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
     );
     console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
     await captureInicial(slug, url);
@@ -842,6 +944,251 @@ app.get("/api/lote/status", (_req, res) => {
   res.json(loteStatus);
 });
 
+// ─── Funis ───────────────────────────────────────────────────────────────────
+
+// API: listar funis de um slug (usada pela dashboard via fetch)
+app.get("/api/funis/:slug", async (req, res) => {
+  const { slug } = req.params;
+  const { rows: funis } = await query(
+    `SELECT id, nome FROM funnels WHERE slug=$1 ORDER BY created_at ASC`, [slug]
+  );
+  const result = await Promise.all(funis.map(async (f) => {
+    const { rows: steps } = await query(
+      `SELECT id, ordem, nome_etapa, url FROM funnel_steps WHERE funnel_id=$1 ORDER BY ordem ASC`, [f.id]
+    );
+    return { ...f, steps };
+  }));
+  res.json(result);
+});
+
+// API: listar funis de TODOS os slugs de uma vez (usada pela dashboard no load)
+app.get("/api/funis-todos", async (_req, res) => {
+  const { rows: funis } = await query(
+    `SELECT f.id, f.slug, f.nome, fs.id as step_id, fs.ordem, fs.nome_etapa, fs.url
+     FROM funnels f
+     LEFT JOIN funnel_steps fs ON fs.funnel_id = f.id
+     ORDER BY f.slug, f.id, fs.ordem`
+  );
+  // Agrupa por slug → funil → steps
+  const map = {};
+  for (const r of funis) {
+    if (!map[r.slug]) map[r.slug] = {};
+    if (!map[r.slug][r.id]) map[r.slug][r.id] = { id: r.id, nome: r.nome, steps: [] };
+    if (r.step_id) {
+      map[r.slug][r.id].steps.push({ id: r.step_id, ordem: r.ordem, nome_etapa: r.nome_etapa, url: r.url });
+    }
+  }
+  // Converte para { slug: [funil, ...] }
+  const out = {};
+  for (const [slug, funiMap] of Object.entries(map)) {
+    out[slug] = Object.values(funiMap);
+  }
+  res.json(out);
+});
+
+// Página de gerenciamento de funis de um player
+app.get("/admin/funis/:slug", async (req, res) => {
+  const { slug } = req.params;
+  const { rows: pages } = await query("SELECT nome FROM pages WHERE slug=$1 LIMIT 1", [slug]);
+  if (!pages.length) return res.status(404).send("Player não encontrado.");
+  const nomePage = pages[0].nome;
+
+  const { rows: funis } = await query(
+    `SELECT id, nome FROM funnels WHERE slug=$1 ORDER BY created_at ASC`, [slug]
+  );
+  const funisComSteps = await Promise.all(funis.map(async (f) => {
+    const { rows: steps } = await query(
+      `SELECT id, ordem, nome_etapa, url FROM funnel_steps WHERE funnel_id=$1 ORDER BY ordem ASC`, [f.id]
+    );
+    return { ...f, steps };
+  }));
+
+  const ETAPA_ICONS = { "Anúncio":"📢","Advertorial":"📄","VSL":"🎬","Quiz":"🧩","Checkout":"💳","Página de Vendas":"🛒","Upsell":"⬆️","Downsell":"⬇️","Obrigado":"✅" };
+
+  const listaFunis = funisComSteps.map(f => {
+    const stepsHtml = f.steps.map(s => {
+      const icon = ETAPA_ICONS[s.nome_etapa] || "🔗";
+      return `<div class="step-item">
+        <span class="step-icon">${icon}</span>
+        <span class="step-nome">${s.nome_etapa}</span>
+        <a href="${s.url}" target="_blank" class="step-url">${s.url.length > 50 ? s.url.slice(0,50)+'...' : s.url}</a>
+        <form method="POST" action="/admin/funis/remover-step" style="display:inline">
+          <input type="hidden" name="step_id" value="${s.id}">
+          <input type="hidden" name="slug" value="${slug}">
+          <button type="submit" class="btn-del-sm" onclick="return confirm('Remover etapa?')">✕</button>
+        </form>
+      </div>`;
+    }).join('<div class="step-arrow">→</div>');
+
+    return `<div class="funil-card">
+      <div class="funil-header">
+        <span class="funil-nome">🔀 ${f.nome}</span>
+        <form method="POST" action="/admin/funis/remover" style="display:inline">
+          <input type="hidden" name="funnel_id" value="${f.id}">
+          <input type="hidden" name="slug" value="${slug}">
+          <button type="submit" class="btn-del" onclick="return confirm('Remover funil ${f.nome}?')">Remover funil</button>
+        </form>
+      </div>
+      <div class="steps-wrap">${stepsHtml || '<span style="color:var(--muted);font-size:12px">Nenhuma etapa cadastrada.</span>'}</div>
+      <details class="add-step-wrap">
+        <summary class="add-step-btn">＋ Adicionar etapa</summary>
+        <form method="POST" action="/admin/funis/add-step" class="step-form">
+          <input type="hidden" name="funnel_id" value="${f.id}">
+          <input type="hidden" name="slug" value="${slug}">
+          <div class="step-form-row">
+            <select name="nome_etapa">
+              <option>Anúncio</option><option>Advertorial</option><option>VSL</option>
+              <option>Quiz</option><option>Página de Vendas</option><option>Checkout</option>
+              <option>Upsell</option><option>Downsell</option><option>Obrigado</option>
+            </select>
+            <input type="url" name="url" placeholder="https://..." required style="flex:1">
+            <button type="submit" class="btn">Salvar</button>
+          </div>
+        </form>
+      </details>
+    </div>`;
+  }).join("");
+
+  const msgOk = (() => {
+    const q = req.query;
+    if (q.ok === "funil-add") return '<div class="msg ok">✅ Funil criado.</div>';
+    if (q.ok === "step-add") return '<div class="msg ok">✅ Etapa adicionada.</div>';
+    if (q.ok === "funil-rem") return '<div class="msg ok">🗑️ Funil removido.</div>';
+    if (q.ok === "step-rem") return '<div class="msg ok">🗑️ Etapa removida.</div>';
+    return "";
+  })();
+
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Funis — ${nomePage}</title>
+<style>
+:root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:900px;margin:0 auto}
+.hdr{display:flex;align-items:center;gap:14px;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.hdr h1{font-size:17px;font-weight:700}
+.hdr-sub{font-size:12px;color:var(--muted);margin-top:3px}
+.hdr a{margin-left:auto;font-size:12px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:6px 14px;border-radius:8px}
+.hdr a:hover{background:var(--accent);color:#fff}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px 22px;margin-bottom:18px}
+.card h2{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:16px}
+.field{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+input,select{background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;padding:9px 13px;outline:none;transition:border-color .2s}
+input:focus,select:focus{border-color:var(--accent)}
+input::placeholder{color:var(--muted)}
+.btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;padding:9px 20px;cursor:pointer;white-space:nowrap}
+.btn:hover{opacity:.85}
+.btn-del{background:transparent;color:var(--down);border:1px solid var(--down);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer}
+.btn-del:hover{background:var(--down);color:#fff}
+.btn-del-sm{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;font-size:10px;padding:2px 6px;cursor:pointer;line-height:1.4}
+.btn-del-sm:hover{color:var(--down);border-color:var(--down)}
+.funil-card{background:#0f0f1e;border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:14px}
+.funil-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.funil-nome{font-size:14px;font-weight:600;color:#fff}
+.steps-wrap{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:14px}
+.step-item{display:flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 10px}
+.step-icon{font-size:14px}
+.step-nome{font-size:12px;font-weight:600;color:#fff}
+.step-url{font-size:10px;color:var(--accent);text-decoration:none;font-family:'Space Mono',monospace;max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:inline-block}
+.step-url:hover{text-decoration:underline}
+.step-arrow{color:var(--muted);font-size:16px;font-weight:700}
+.add-step-wrap{margin-top:4px}
+.add-step-btn{font-size:12px;color:var(--accent);cursor:pointer;list-style:none;padding:6px 0}
+.add-step-btn::-webkit-details-marker{display:none}
+.step-form-row{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+.step-form-row select{width:160px}
+.empty-funis{color:var(--muted);font-size:13px;text-align:center;padding:20px;border:1px dashed var(--border);border-radius:10px;margin-bottom:14px}
+.msg{padding:11px 14px;border-radius:8px;font-size:13px;margin-bottom:16px}
+.msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
+.divider{border:none;border-top:1px solid var(--border);margin:14px 0}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div>
+    <h1>🔀 Funis — ${nomePage}</h1>
+    <div class="hdr-sub">Mapeamento completo de etapas e URLs</div>
+  </div>
+  <a href="/admin">← Voltar ao Admin</a>
+</div>
+
+${msgOk}
+
+<div class="card">
+  <h2>➕ Novo funil</h2>
+  <form method="POST" action="/admin/funis/add">
+    <input type="hidden" name="slug" value="${slug}">
+    <div class="field">
+      <label>Nome do funil</label>
+      <input type="text" name="nome" placeholder="Ex: Funil Principal VSL, Funil Quiz v2" required>
+    </div>
+    <button type="submit" class="btn">Criar funil</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>🔀 Funis cadastrados (${funisComSteps.length})</h2>
+  ${funisComSteps.length === 0
+    ? '<div class="empty-funis">Nenhum funil cadastrado ainda. Crie o primeiro acima.</div>'
+    : listaFunis}
+</div>
+</body>
+</html>`);
+});
+
+app.post("/admin/funis/add", async (req, res) => {
+  const { slug, nome } = req.body;
+  if (!slug || !nome) return res.redirect("/admin");
+  await query(`INSERT INTO funnels (slug, nome) VALUES ($1, $2)`, [slug, nome]);
+  console.log(`[FUNIS] criou funil slug=${slug} nome=${nome}`);
+  res.redirect(`/admin/funis/${slug}?ok=funil-add`);
+});
+
+app.post("/admin/funis/remover", async (req, res) => {
+  const { funnel_id, slug } = req.body;
+  if (!funnel_id) return res.redirect("/admin");
+  await query(`DELETE FROM funnels WHERE id=$1`, [funnel_id]);
+  console.log(`[FUNIS] removeu funnel_id=${funnel_id}`);
+  res.redirect(`/admin/funis/${slug}?ok=funil-rem`);
+});
+
+app.post("/admin/funis/add-step", async (req, res) => {
+  const { funnel_id, slug, nome_etapa, url } = req.body;
+  if (!funnel_id || !nome_etapa || !url) return res.redirect(`/admin/funis/${slug}`);
+  const { rows } = await query(
+    `SELECT COALESCE(MAX(ordem),0)+1 AS prox FROM funnel_steps WHERE funnel_id=$1`, [funnel_id]
+  );
+  const ordem = rows[0].prox;
+  await query(
+    `INSERT INTO funnel_steps (funnel_id, ordem, nome_etapa, url) VALUES ($1,$2,$3,$4)`,
+    [funnel_id, ordem, nome_etapa, url]
+  );
+  console.log(`[FUNIS] add-step funnel_id=${funnel_id} etapa=${nome_etapa}`);
+  res.redirect(`/admin/funis/${slug}?ok=step-add`);
+});
+
+app.post("/admin/funis/remover-step", async (req, res) => {
+  const { step_id, slug } = req.body;
+  if (!step_id) return res.redirect("/admin");
+  await query(`DELETE FROM funnel_steps WHERE id=$1`, [step_id]);
+  // Reordena as etapas restantes
+  const { rows: steps } = await query(
+    `SELECT fs.id FROM funnel_steps fs
+     JOIN funnel_steps s2 ON s2.id=$1
+     WHERE fs.funnel_id=s2.funnel_id
+     ORDER BY fs.ordem ASC`,
+    [step_id]
+  ).catch(() => ({ rows: [] }));
+  for (let i = 0; i < steps.length; i++) {
+    await query(`UPDATE funnel_steps SET ordem=$1 WHERE id=$2`, [i + 1, steps[i].id]);
+  }
+  console.log(`[FUNIS] removeu step_id=${step_id}`);
+  res.redirect(`/admin/funis/${slug}?ok=step-rem`);
+});
+
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
 // SVG da logo do Instagram (inline, sem dependência externa)
@@ -850,7 +1197,7 @@ const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://ww
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -863,7 +1210,7 @@ app.get("/dashboard", async (_req, res) => {
       const primeiraData = {};
       const paginas = {};
       const mon = {};
-      const meta = {}; // instagram_url, geo, nicho por nome
+      const meta = {}; // instagram_url, geo, nicho, funil por nome
 
       for (const p of pagesDoGrupo) {
         const { rows: hist } = await query(
@@ -898,6 +1245,7 @@ app.get("/dashboard", async (_req, res) => {
           instagram_url: p.instagram_url || null,
           geo:           p.geo || null,
           nicho:         p.nicho || null,
+          funil:         p.funil || null,
         };
 
         paginas[p.nome] = {};
@@ -1017,6 +1365,7 @@ tbody tr:hover td{background:var(--surface2)}
 .t-meta-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
 .t-geo-badge{font-size:10px;background:rgba(34,211,238,.1);color:#22d3ee;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
 .t-nicho-badge{font-size:10px;background:rgba(167,139,250,.12);color:#a78bfa;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
+.t-funil-badge{font-size:10px;background:rgba(251,191,36,.12);color:#fbbf24;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:7px;font-size:11px;font-weight:600;font-family:'Space Grotesk'}
 .b-up{background:rgba(52,211,153,.13);color:#34d399}
 .b-hot{background:rgba(167,139,250,.15);color:#a78bfa}
@@ -1077,39 +1426,6 @@ tbody tr:hover td{background:var(--surface2)}
   </div>
 </div>
 
-<div class="group-title">🌐 DOMÍNIOS — rastreio por URL</div>
-
-<div class="section-label">🚀 Escalando agora — domínios em ascensão</div>
-<div class="scaling-strip" id="dom_scaling"></div>
-<div class="empty-hint" id="dom_scaling-empty" style="display:none">Nenhum item em ascensão no período. Conforme as coletas acumulam, o que cresce aparece aqui.</div>
-
-<div class="grid-charts">
-  <div class="panel">
-    <div class="panel-title">🍩 Distribuição atual</div>
-    <div class="rosca-wrap">
-      <div class="rosca-canvas"><canvas id="dom_cRosca"></canvas></div>
-      <div class="legend" id="dom_legend"></div>
-    </div>
-  </div>
-  <div class="panel">
-    <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
-    <div class="hist-box"><canvas id="dom_cHist"></canvas></div>
-  </div>
-</div>
-
-<div class="section-label">📋 Resumo completo</div>
-<div class="tbl-panel">
-  <table>
-    <thead><tr>
-      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
-    </tr></thead>
-    <tbody id="dom_tbody"></tbody>
-  </table>
-</div>
-
-<div style="height:36px"></div>
-
 <div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
 
 <div class="section-label">🚀 Escalando agora — bibliotecas em ascensão</div>
@@ -1143,24 +1459,79 @@ tbody tr:hover td{background:var(--surface2)}
 
 <div style="height:36px"></div>
 
+<div class="group-title">🌐 DOMÍNIOS — rastreio por URL</div>
+
+<div class="section-label">🚀 Escalando agora — domínios em ascensão</div>
+<div class="scaling-strip" id="dom_scaling"></div>
+<div class="empty-hint" id="dom_scaling-empty" style="display:none">Nenhum item em ascensão no período. Conforme as coletas acumulam, o que cresce aparece aqui.</div>
+
+<div class="grid-charts">
+  <div class="panel">
+    <div class="panel-title">🍩 Distribuição atual</div>
+    <div class="rosca-wrap">
+      <div class="rosca-canvas"><canvas id="dom_cRosca"></canvas></div>
+      <div class="legend" id="dom_legend"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+    <div class="hist-box"><canvas id="dom_cHist"></canvas></div>
+  </div>
+</div>
+
+<div class="section-label">📋 Resumo completo</div>
+<div class="tbl-panel">
+  <table>
+    <thead><tr>
+      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
+    </tr></thead>
+    <tbody id="dom_tbody"></tbody>
+  </table>
+</div>
+
+<div style="height:36px"></div>
+
+<div class="group-title">🔀 Mapeamento de Funis</div>
+
+<div class="tbl-panel">
+  <table>
+    <thead><tr>
+      <th>Player</th><th>Tipo</th><th>Funis cadastrados</th><th>Visualizar</th>
+    </tr></thead>
+    <tbody id="funis_tbody"></tbody>
+  </table>
+</div>
+
+<!-- Modal de funis -->
+<div id="funil-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;padding:20px">
+  <div style="background:#12121f;border:1px solid #23233f;border-radius:16px;padding:24px;max-width:700px;width:100%;max-height:80vh;overflow-y:auto;position:relative">
+    <button onclick="document.getElementById('funil-modal').style.display='none'" style="position:absolute;top:14px;right:16px;background:transparent;border:none;color:#7a7a98;font-size:20px;cursor:pointer;line-height:1">✕</button>
+    <div id="funil-modal-title" style="font-size:15px;font-weight:700;color:#fff;margin-bottom:18px"></div>
+    <div id="funil-modal-body"></div>
+  </div>
+</div>
+
+<div style="height:36px"></div>
+
 <div class="group-title">📅 Histórico de Coletas</div>
 
 <div class="accordion-wrap">
-  <button class="accordion-btn" onclick="toggleAccordion('dom_hist-section','dom_acc-icon')">
-    <span>🌐 Histórico de Coletas — Domínios · 03h · 12h · 22h</span>
-    <span class="acc-meta" id="dom_acc-meta"></span>
-    <span class="acc-icon" id="dom_acc-icon">▼</span>
-  </button>
-  <div class="accordion-body" id="dom_hist-section">Carregando histórico...</div>
-</div>
-
-<div class="accordion-wrap" style="margin-top:12px">
   <button class="accordion-btn" onclick="toggleAccordion('pag_hist-section','pag_acc-icon')">
     <span>📡 Histórico de Coletas — Bibliotecas · 03h · 12h · 22h</span>
     <span class="acc-meta" id="pag_acc-meta"></span>
     <span class="acc-icon" id="pag_acc-icon">▼</span>
   </button>
   <div class="accordion-body" id="pag_hist-section">Carregando histórico...</div>
+</div>
+
+<div class="accordion-wrap" style="margin-top:12px">
+  <button class="accordion-btn" onclick="toggleAccordion('dom_hist-section','dom_acc-icon')">
+    <span>🌐 Histórico de Coletas — Domínios · 03h · 12h · 22h</span>
+    <span class="acc-meta" id="dom_acc-meta"></span>
+    <span class="acc-icon" id="dom_acc-icon">▼</span>
+  </button>
+  <div class="accordion-body" id="dom_hist-section">Carregando histórico...</div>
 </div>
 
 <script>
@@ -1247,7 +1618,8 @@ porAds.forEach((pag,idx)=>{
   const m=meta?.[pag]||{};
   const geoBadge=m.geo?'<span class="t-geo-badge">🌍 '+m.geo+'</span>':'';
   const nichoBadge=m.nicho?'<span class="t-nicho-badge">🏷️ '+m.nicho+'</span>':'';
-  const metaBadgesHtml=(geoBadge||nichoBadge)?'<div class="t-meta-badges">'+geoBadge+nichoBadge+'</div>':'';
+  const funilBadge=m.funil?'<span class="t-funil-badge">🎯 '+m.funil+'</span>':'';
+  const metaBadgesHtml=(geoBadge||nichoBadge||funilBadge)?'<div class="t-meta-badges">'+geoBadge+nichoBadge+funilBadge+'</div>':'';
   const nomeCell='<span class="t-name-main"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></span>'+metaBadgesHtml;
 
   // Célula do Instagram
@@ -1362,8 +1734,94 @@ const HD_PAG=__HIST_PLACEHOLDER__;
 const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length;
 document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
 
-render(D_DOM,HD_DOM,"dom_");
 render(D_PAG,HD_PAG,"pag_");
+render(D_DOM,HD_DOM,"dom_");
+
+// ── Tabela de Funis + Modal ─────────────────────────────────────────────────
+const ETAPA_ICONS={'Anúncio':'📢','Advertorial':'📄','VSL':'🎬','Quiz':'🧩','Checkout':'💳','Página de Vendas':'🛒','Upsell':'⬆️','Downsell':'⬇️','Obrigado':'✅'};
+
+async function carregarFunis(){
+  try{
+    const r=await fetch('/api/funis-todos');
+    const funisPorSlug=await r.json();
+
+    // Monta lista de todos os players (pags + dom) na ordem da dashboard
+    const allNomes=[
+      ...Object.keys(D_PAG.pags).sort((a,b)=>(D_PAG.ultima[b]?.ads||0)-(D_PAG.ultima[a]?.ads||0)),
+      ...Object.keys(D_DOM.pags).sort((a,b)=>(D_DOM.ultima[b]?.ads||0)-(D_DOM.ultima[a]?.ads||0))
+    ];
+    // Precisa mapear nome→slug; a API /api/funis-todos usa slug como chave
+    // Buscamos todos os slugs via /api/paginas já carregado implicitamente nos dados do servidor
+    // Fazemos outro fetch simples
+    const rpags=await fetch('/api/paginas');
+    const paginas=await rpags.json();
+    const nomeToSlug={};
+    const nomeToTipo={};
+    paginas.forEach(p=>{nomeToSlug[p.nome]=p.slug;nomeToTipo[p.nome]=p.tipo;});
+
+    const tbody=document.getElementById('funis_tbody');
+    tbody.innerHTML='';
+
+    const playersComFunil=allNomes.filter(nome=>nomeToSlug[nome]);
+    if(!playersComFunil.length){
+      tbody.innerHTML='<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">Nenhum player cadastrado ainda.</td></tr>';
+      return;
+    }
+
+    playersComFunil.forEach(nome=>{
+      const slug=nomeToSlug[nome];
+      const tipo=nomeToTipo[nome];
+      const funis=funisPorSlug[slug]||[];
+      const tr=document.createElement('tr');
+      const tipoLabel=tipo==='dominio'?'<span style="font-size:11px;background:rgba(124,111,255,.15);color:#a78bfa;padding:2px 8px;border-radius:5px;font-weight:600">🌐 Domínio</span>':'<span style="font-size:11px;background:rgba(52,211,153,.12);color:#34d399;padding:2px 8px;border-radius:5px;font-weight:600">📡 Biblioteca</span>';
+      const funisBadges=funis.length
+        ?funis.map(f=>'<span style="font-size:10px;background:rgba(167,139,250,.12);color:#a78bfa;padding:2px 7px;border-radius:5px;margin-right:4px">'+f.nome+'</span>').join('')
+        :'<span style="color:var(--muted);font-size:12px">—</span>';
+      tr.innerHTML=
+        '<td style="font-weight:600;color:#fff">'+nome+'</td>'
+        +'<td>'+tipoLabel+'</td>'
+        +'<td>'+funisBadges+'</td>'
+        +'<td>'+(funis.length?'<button class="btn-ver-funil" onclick="abrirModal(\''+slug+'\',\''+nome.replace(/'/g,"\\'")+'\')" style="background:transparent;border:1px solid var(--accent);color:var(--accent);border-radius:6px;font-size:11px;padding:4px 10px;cursor:pointer;font-family:Space Grotesk,sans-serif">👁 Ver funis</button>':'<span style="color:var(--muted);font-size:12px">—</span>')+'</td>';
+      tbody.appendChild(tr);
+    });
+
+    // Guarda funisPorSlug globalmente para o modal
+    window._funisPorSlug=funisPorSlug;
+  }catch(e){
+    console.error('Erro ao carregar funis:',e);
+  }
+}
+
+function abrirModal(slug,nome){
+  const funis=(window._funisPorSlug||{})[slug]||[];
+  document.getElementById('funil-modal-title').textContent='🔀 Funis — '+nome;
+  const body=document.getElementById('funil-modal-body');
+  if(!funis.length){body.innerHTML='<p style="color:var(--muted);font-size:13px">Nenhum funil cadastrado.</p>';
+  }else{
+    body.innerHTML=funis.map(f=>{
+      const stepsHtml=f.steps.length
+        ?f.steps.map((s,i)=>{
+          const icon=ETAPA_ICONS[s.nome_etapa]||'🔗';
+          return (i>0?'<span style="color:var(--muted);font-size:18px;font-weight:700;margin:0 4px">→</span>':'')+
+            '<a href="'+s.url+'" target="_blank" rel="noopener" style="display:inline-flex;flex-direction:column;align-items:center;gap:3px;text-decoration:none;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:8px 12px;min-width:80px;max-width:130px">'
+            +'<span style="font-size:18px">'+icon+'</span>'
+            +'<span style="font-size:11px;font-weight:600;color:#fff;text-align:center">'+s.nome_etapa+'</span>'
+            +'<span style="font-size:9px;color:var(--accent);font-family:Space Mono,monospace;text-align:center;word-break:break-all;max-width:110px">'+s.url.replace(/https?:\/\//,'').slice(0,30)+(s.url.length>36?'...':'')+'</span>'
+            +'</a>';
+        }).join('')
+        :'<span style="color:var(--muted);font-size:12px">Nenhuma etapa cadastrada.</span>';
+      return '<div style="margin-bottom:20px">'
+        +'<div style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px">'+f.nome+'</div>'
+        +'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px">'+stepsHtml+'</div>'
+        +'</div>';
+    }).join('<hr style="border:none;border-top:1px solid var(--border);margin:4px 0 16px">');
+  }
+  const modal=document.getElementById('funil-modal');
+  modal.style.display='flex';
+  modal.onclick=e=>{if(e.target===modal)modal.style.display='none';};
+}
+
+carregarFunis();
 
 <\/script>
 </body>
