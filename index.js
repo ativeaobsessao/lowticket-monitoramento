@@ -492,7 +492,7 @@ async function runAllScrapes(trigger = "cron") {
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho, funil } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
   if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
@@ -509,7 +509,32 @@ app.post("/api/salvar", async (req, res) => {
     [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
   );
   console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
-  const inicial = await captureInicial(slug, url);
+
+  let inicial = ads_count_inicial;
+  if (inicial !== undefined && inicial !== null) {
+    const countNum = parseInt(inicial, 10) || 0;
+    await query(
+      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
+      [slug, countNum]
+    );
+    await query(
+      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (slug) DO UPDATE
+         SET ads_count    = EXCLUDED.ads_count,
+             collected_at = EXCLUDED.collected_at`,
+      [slug, countNum]
+    );
+    await query(
+      `INSERT INTO scrape_history (slug, ads_count, slot) VALUES ($1, $2, NULL)`,
+      [slug, countNum]
+    );
+    inicial = countNum;
+    console.log(`[DESCOBERTA] slug=${slug} inicial=${countNum} salvo via Extensão (Sem Playwright)`);
+  } else {
+    inicial = await captureInicial(slug, url);
+  }
+
   res.json({ slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${slug}` });
 });
 
@@ -1220,6 +1245,77 @@ app.post("/admin/funis/remover-edge", async (req, res) => {
   await query(`DELETE FROM funnel_edges WHERE id=$1`, [edge_id]);
   console.log(`[FUNIS] remover-edge edge_id=${edge_id}`);
   res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
+});
+
+app.post("/api/funis/salvar-node", async (req, res) => {
+  const { slug, tipo, rotulo, url, checkout_url } = req.body;
+  if (!slug || !tipo || !rotulo || !url) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    // 1. Resolve ou cria o nó da Landing Page
+    let landingNodeId;
+    const { rows: existingLanding } = await query(
+      "SELECT id FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
+      [slug, url]
+    );
+
+    if (existingLanding.length > 0) {
+      landingNodeId = existingLanding[0].id;
+      // Atualiza o tipo e rótulo caso tenham mudado
+      await query(
+        "UPDATE funnel_nodes SET tipo = $1, rotulo = $2 WHERE id = $3",
+        [tipo, rotulo, landingNodeId]
+      );
+    } else {
+      const { rows: newLanding } = await query(
+        "INSERT INTO funnel_nodes (slug, tipo, rotulo, url) VALUES ($1, $2, $3, $4) RETURNING id",
+        [slug, tipo, rotulo, url]
+      );
+      landingNodeId = newLanding[0].id;
+    }
+
+    // 2. Se houver checkout preenchido, resolve o nó do checkout e conecta
+    if (checkout_url && checkout_url.trim()) {
+      let checkoutNodeId;
+      const cleanCheckout = checkout_url.trim();
+
+      const { rows: existingCheckout } = await query(
+        "SELECT id FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
+        [slug, cleanCheckout]
+      );
+
+      if (existingCheckout.length > 0) {
+        checkoutNodeId = existingCheckout[0].id;
+      } else {
+        const { rows: newCheckout } = await query(
+          "INSERT INTO funnel_nodes (slug, tipo, rotulo, url) VALUES ($1, 'checkout', 'Checkout', $2) RETURNING id",
+          [slug, cleanCheckout]
+        );
+        checkoutNodeId = newCheckout[0].id;
+      }
+
+      // 3. Cria a conexão (edge) entre a Landing Page e o Checkout se não existir
+      const { rows: existingEdge } = await query(
+        "SELECT id FROM funnel_edges WHERE from_node_id = $1 AND to_node_id = $2 LIMIT 1",
+        [landingNodeId, checkoutNodeId]
+      );
+
+      if (existingEdge.length === 0) {
+        await query(
+          "INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1, $2)",
+          [landingNodeId, checkoutNodeId]
+        );
+        console.log(`[FUNIL] Conectou nó ${landingNodeId} ao checkout ${checkoutNodeId}`);
+      }
+    }
+
+    res.json({ success: true, landingNodeId });
+  } catch (err) {
+    console.error("[API] Error saving funnel node:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 // Página de visão geral — mapa de funis de todos os players
