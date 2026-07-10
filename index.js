@@ -1078,13 +1078,15 @@ app.get("/admin/funis/:slug", async (req, res) => {
   const listaEdges = edges.length ? edges.map(e => {
     const de = nodesById[e.from_node_id], para = nodesById[e.to_node_id];
     if (!de || !para) return "";
+    const label = de.rotulo + ' \u2192 ' + para.rotulo;
     return `<div class="edge-row">
       ${renderChip(de)}<span class="chip-arrow">→</span>${renderChip(para)}
-      <form method="POST" action="/admin/funis/remover-edge" style="display:inline;margin-left:auto">
+      <form id="form-rem-${e.id}" method="POST" action="/admin/funis/remover-edge" style="display:none">
         <input type="hidden" name="edge_id" value="${e.id}">
         <input type="hidden" name="slug" value="${slug}">
-        <button type="submit" class="btn-del-sm" onclick="return confirm('Remover essa conexão?')">✕</button>
       </form>
+      <button type="button" class="btn-del-sm" style="margin-left:auto"
+        onclick="abrirModalRemover(${e.id},'${label.replace(/'/g, "\\'")}')">&#x2715;</button>
     </div>`;
   }).join("") : '<div class="empty-hint-sm">Nenhuma conexão criada ainda.</div>';
 
@@ -1128,18 +1130,14 @@ input:focus,select:focus{border-color:var(--accent)}
 input::placeholder{color:var(--muted)}
 .form-row{display:grid;grid-template-columns:180px 160px 1fr auto;gap:10px;align-items:end}
 .form-row-edge{display:grid;grid-template-columns:1fr auto 1fr auto;gap:10px;align-items:end}
-.edge-form-layout{display:flex;align-items:flex-start;gap:14px}
-.edge-col-de{flex:1}
-.edge-col-arrow{padding-top:27px;color:var(--muted);font-size:16px;flex-shrink:0}
-.edge-col-para{flex:1;display:flex;flex-direction:column;gap:8px}
-.edge-col-para>label{display:block;margin-bottom:6px}
-.para-row{display:flex;align-items:center;gap:8px}
-.para-row select{flex:1}
-.btn-add-para{background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-size:18px;font-weight:700;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0}
-.btn-add-para:hover{background:var(--accent);color:#fff}
-.btn-rem-para{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:12px;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0}
-.btn-rem-para:hover{color:var(--down);border-color:var(--down)}
-@media(max-width:700px){.form-row,.form-row-edge{grid-template-columns:1fr}.edge-form-layout{flex-direction:column}}
+.chain-builder{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px}
+.chain-elo{display:flex;flex-direction:column;gap:6px;min-width:160px;flex:1}
+.chain-arrow{color:var(--muted);font-size:16px;padding-bottom:10px;flex-shrink:0}
+.btn-chain-add{background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-size:18px;font-weight:700;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0;margin-bottom:1px}
+.btn-chain-add:hover{background:var(--accent);color:#fff}
+.btn-chain-rem{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:12px;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0;margin-bottom:1px}
+.btn-chain-rem:hover{color:var(--down);border-color:var(--down)}
+@media(max-width:700px){.form-row,.form-row-edge{grid-template-columns:1fr}.chain-builder{flex-direction:column}}
 .btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;padding:9px 20px;cursor:pointer;white-space:nowrap}
 .btn:hover{opacity:.85}
 .btn-del-sm{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;font-size:10px;padding:2px 6px;cursor:pointer;line-height:1.4;margin-left:8px}
@@ -1160,9 +1158,35 @@ input::placeholder{color:var(--muted)}
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
 .msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
 .divider{border:none;border-top:1px solid var(--border);margin:14px 0}
+/* Modal Apple-style */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;z-index:9999;opacity:0;pointer-events:none;transition:opacity .2s ease}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal-card{background:#1c1c2e;border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:30px 28px 24px;max-width:340px;width:calc(100% - 40px);box-shadow:0 40px 100px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.06);transform:scale(.92) translateY(12px);transition:transform .28s cubic-bezier(.34,1.4,.64,1),opacity .22s ease;opacity:0;text-align:center}
+.modal-overlay.open .modal-card{transform:scale(1) translateY(0);opacity:1}
+.modal-icon{font-size:38px;margin-bottom:14px;line-height:1}
+.modal-title{font-size:16px;font-weight:700;color:#fff;margin-bottom:8px;letter-spacing:-.2px}
+.modal-desc{font-size:13px;color:#8888aa;margin-bottom:24px;line-height:1.6;word-break:break-all}
+.modal-actions{display:flex;gap:10px}
+.modal-btn-cancel{flex:1;background:rgba(255,255,255,.07);color:#e0e0f0;border:1px solid rgba(255,255,255,.1);border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;padding:12px 0;cursor:pointer;transition:background .15s}
+.modal-btn-cancel:hover{background:rgba(255,255,255,.13)}
+.modal-btn-confirm{flex:1;background:#fb7185;color:#fff;border:none;border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;padding:12px 0;cursor:pointer;transition:background .15s,transform .1s}
+.modal-btn-confirm:hover{background:#f43f5e}
+.modal-btn-confirm:active{transform:scale(.97)}
 </style>
 </head>
 <body>
+<!-- Modal Apple-style: confirmação de remoção de conexão -->
+<div class="modal-overlay" id="modal-remover-edge" onclick="fecharModalEdgeOverlay(event)">
+  <div class="modal-card">
+    <div class="modal-icon">🗑️</div>
+    <h3 class="modal-title">Remover conexão</h3>
+    <p class="modal-desc" id="modal-edge-desc"></p>
+    <div class="modal-actions">
+      <button class="modal-btn-cancel" onclick="fecharModalEdge()">Cancelar</button>
+      <button class="modal-btn-confirm" onclick="confirmarRemoverEdge()">Remover</button>
+    </div>
+  </div>
+</div>
 <div class="hdr">
   <div>
     <h1>🔀 Funil — ${nomePage}</h1>
@@ -1201,21 +1225,23 @@ ${msgOk}
     ? '<div class="empty-hint-sm">Cadastre pelo menos 2 etapas para poder conectá-las.</div>'
     : `<form method="POST" action="/admin/funis/add-edge" id="form-add-edge">
         <input type="hidden" name="slug" value="${slug}">
-        <div class="edge-form-layout">
-          <div class="edge-col-de">
-            <div class="field"><label>De</label><select name="from_node_id">${optionsNodes}</select></div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:12px;line-height:1.5">
+          Monte a sequência completa do funil. Cada etapa conecta à próxima em cadeia.
+        </div>
+        <div class="chain-builder" id="chain-builder">
+          <div class="chain-elo">
+            <label>Etapa 1</label>
+            <select name="chain_ids[]">${optionsNodes}</select>
           </div>
-          <div class="edge-col-arrow">→</div>
-          <div class="edge-col-para" id="para-list">
-            <label>Para</label>
-            <div class="para-row">
-              <select name="to_node_ids[]">${optionsNodes}</select>
-              <button type="button" class="btn-add-para" onclick="adicionarPara()" title="Adicionar outro destino">+</button>
-            </div>
+          <div class="chain-arrow" id="chain-arrow-1">→</div>
+          <div class="chain-elo" id="chain-elo-2">
+            <label>Etapa 2</label>
+            <select name="chain_ids[]">${optionsNodes}</select>
           </div>
+          <button type="button" class="btn-chain-add" id="btn-chain-add" onclick="adicionarElo()" title="Adicionar próxima etapa na cadeia">+</button>
         </div>
         <div style="margin-top:14px;display:flex;justify-content:flex-end">
-          <button type="submit" class="btn">Conectar</button>
+          <button type="submit" class="btn">Conectar Cadeia</button>
         </div>
       </form>`}
 </div>
@@ -1231,23 +1257,71 @@ ${msgOk}
 </div>
 
 <script>
-function adicionarPara(){
-  var paraList=document.getElementById('para-list');
-  var firstSel=paraList.querySelector('select');
-  var newRow=document.createElement('div');
-  newRow.className='para-row';
-  var newSel=firstSel.cloneNode(true);
-  newSel.selectedIndex=0;
+var _chainCount=2;
+var _optionsHtml=(function(){
+  var sel=document.querySelector('#chain-builder select');
+  return sel?sel.innerHTML:'';
+})();
+function adicionarElo(){
+  _chainCount++;
+  var builder=document.getElementById('chain-builder');
+  var addBtn=document.getElementById('btn-chain-add');
+  var arrow=document.createElement('div');
+  arrow.className='chain-arrow';
+  arrow.textContent='\u2192';
+  var elo=document.createElement('div');
+  elo.className='chain-elo';
+  elo.id='chain-elo-'+_chainCount;
+  var lbl=document.createElement('label');
+  lbl.textContent='Etapa '+_chainCount;
+  var sel=document.createElement('select');
+  sel.name='chain_ids[]';
+  sel.innerHTML=_optionsHtml;
+  var remWrap=document.createElement('div');
+  remWrap.style.cssText='display:flex;align-items:flex-end;gap:8px';
   var remBtn=document.createElement('button');
   remBtn.type='button';
-  remBtn.className='btn-rem-para';
+  remBtn.className='btn-chain-rem';
   remBtn.textContent='\u2715';
-  remBtn.title='Remover este destino';
-  remBtn.onclick=function(){newRow.remove();};
-  newRow.appendChild(newSel);
-  newRow.appendChild(remBtn);
-  paraList.appendChild(newRow);
+  remBtn.title='Remover esta etapa';
+  remBtn.onclick=function(){arrow.remove();elo.remove();};
+  elo.appendChild(lbl);
+  elo.appendChild(sel);
+  builder.insertBefore(arrow,addBtn);
+  builder.insertBefore(elo,addBtn);
+  var remArrow=document.createElement('div');
+  remArrow.className='chain-arrow';
+  remArrow.textContent='';
+  builder.insertBefore(remBtn,addBtn);
 }
+
+/* ── Modal Apple-style para remover conexão ── */
+var _edgeToRemove=null;
+function abrirModalRemover(edgeId,label){
+  _edgeToRemove=edgeId;
+  document.getElementById('modal-edge-desc').textContent=label;
+  var m=document.getElementById('modal-remover-edge');
+  m.classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function fecharModalEdge(){
+  var m=document.getElementById('modal-remover-edge');
+  m.classList.remove('open');
+  document.body.style.overflow='';
+}
+function fecharModalEdgeOverlay(e){
+  if(e.target===document.getElementById('modal-remover-edge')) fecharModalEdge();
+}
+function confirmarRemoverEdge(){
+  if(!_edgeToRemove) return;
+  sessionStorage.setItem('funil_scroll_y', window.scrollY);
+  document.getElementById('form-rem-'+_edgeToRemove).submit();
+}
+/* Restaurar posição do scroll após redirect */
+(function(){
+  var y=sessionStorage.getItem('funil_scroll_y');
+  if(y!==null){ window.scrollTo({top:parseInt(y,10),behavior:'instant'}); sessionStorage.removeItem('funil_scroll_y'); }
+})();
 </script>
 </body>
 </html>`);
@@ -1271,18 +1345,20 @@ app.post("/admin/funis/remover-node", async (req, res) => {
 });
 
 app.post("/admin/funis/add-edge", async (req, res) => {
-  const { slug, from_node_id } = req.body;
-  // Aceita to_node_ids[] (multi-destino, novo) com fallback para to_node_id (legado/compat.)
-  let toIds = req.body.to_node_ids ?? req.body.to_node_id;
-  if (!Array.isArray(toIds)) toIds = toIds ? [toIds] : [];
-  toIds = toIds.filter(Boolean);
+  const { slug } = req.body;
+  // chain_ids[]: array ordenado de IDs — cria arestas entre pares consecutivos
+  let chain = req.body.chain_ids;
+  if (!Array.isArray(chain)) chain = chain ? [chain] : [];
+  chain = chain.map(String).filter(Boolean);
 
-  if (!slug || !from_node_id || toIds.length === 0) return res.redirect(`/admin/funis/${slug || ""}`);
+  if (!slug || chain.length < 2) return res.redirect(`/admin/funis/${slug || ""}`);
 
-  for (const to_node_id of toIds) {
-    if (from_node_id === to_node_id) return res.redirect(`/admin/funis/${slug}?erro=mesma-etapa`);
-    await query(`INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1,$2)`, [from_node_id, to_node_id]);
-    console.log(`[FUNIS] add-edge ${from_node_id} -> ${to_node_id}`);
+  for (let i = 0; i < chain.length - 1; i++) {
+    const from = chain[i];
+    const to   = chain[i + 1];
+    if (from === to) return res.redirect(`/admin/funis/${slug}?erro=mesma-etapa`);
+    await query(`INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1,$2)`, [from, to]);
+    console.log(`[FUNIS] add-edge (cadeia) ${from} -> ${to}`);
   }
   res.redirect(`/admin/funis/${slug}?ok=edge-add`);
 });
