@@ -992,27 +992,80 @@ const TIPOS_ORDEM = ["advertorial", "tsl", "vsl", "quiz", "whatsapp", "checkout"
 function computarCaminhos(nodes, edges) {
   const nodesById = {};
   nodes.forEach(n => { nodesById[n.id] = n; });
-  const adj = {};
-  edges.forEach(e => {
-    if (!adj[e.from_node_id]) adj[e.from_node_id] = [];
-    adj[e.from_node_id].push(e.to_node_id);
-  });
-  const temEntrada = new Set(edges.map(e => e.to_node_id));
-  const raizes = nodes.filter(n => !temEntrada.has(n.id));
 
-  const caminhos = [];
-  function dfs(nodeId, caminho) {
-    if (caminho.includes(nodeId)) { caminhos.push([...caminho]); return; }
-    const novoCaminho = [...caminho, nodeId];
-    const proximos = adj[nodeId] || [];
-    if (proximos.length === 0) {
-      caminhos.push(novoCaminho);
-    } else {
-      proximos.forEach(p => dfs(p, novoCaminho));
+  const adjOut = {};
+  const adjIn = {};
+  const adjUndir = {};
+  nodes.forEach(n => {
+    adjOut[n.id] = [];
+    adjIn[n.id] = [];
+    adjUndir[n.id] = [];
+  });
+  edges.forEach(e => {
+    if (adjOut[e.from_node_id] && adjIn[e.to_node_id]) {
+      adjOut[e.from_node_id].push(e.to_node_id);
+      adjIn[e.to_node_id].push(e.from_node_id);
+      adjUndir[e.from_node_id].push(e.to_node_id);
+      adjUndir[e.to_node_id].push(e.from_node_id);
     }
-  }
-  raizes.forEach(r => dfs(r.id, []));
-  return caminhos.map(c => c.map(id => nodesById[id]).filter(Boolean));
+  });
+
+  const visited = new Set();
+  const componentes = [];
+  nodes.forEach(n => {
+    if (visited.has(n.id)) return;
+    if (adjUndir[n.id].length === 0) return;
+    const comp = [];
+    const queue = [n.id];
+    visited.add(n.id);
+    while (queue.length > 0) {
+      const curr = queue.shift();
+      comp.push(curr);
+      adjUndir[curr].forEach(nxt => {
+        if (!visited.has(nxt)) {
+          visited.add(nxt);
+          queue.push(nxt);
+        }
+      });
+    }
+    if (comp.length >= 2) componentes.push(comp);
+  });
+
+  const funisMapeados = [];
+  componentes.forEach(comp => {
+    const compSet = new Set(comp);
+    let raizes = comp.filter(id => adjIn[id].filter(x => compSet.has(x)).length === 0);
+    if (raizes.length === 0) raizes = [comp[0]];
+
+    const levels = [];
+    const assigned = new Set();
+    let currentLevel = [...raizes];
+    currentLevel.forEach(id => assigned.add(id));
+
+    while (currentLevel.length > 0) {
+      levels.push(currentLevel.map(id => nodesById[id]).filter(Boolean));
+      const nextLevelSet = new Set();
+      currentLevel.forEach(id => {
+        adjOut[id].forEach(nxt => {
+          if (compSet.has(nxt) && !assigned.has(nxt)) {
+            nextLevelSet.add(nxt);
+          }
+        });
+      });
+      currentLevel = Array.from(nextLevelSet);
+      currentLevel.forEach(id => assigned.add(id));
+    }
+
+    const remaining = comp.filter(id => !assigned.has(id)).map(id => nodesById[id]).filter(Boolean);
+    if (remaining.length > 0) {
+      if (levels.length > 0) levels[levels.length - 1].push(...remaining);
+      else levels.push(remaining);
+    }
+
+    funisMapeados.push(levels);
+  });
+
+  return funisMapeados;
 }
 
 async function getNodesEdges(slug) {
@@ -1043,12 +1096,24 @@ function renderSetaApple() {
   return `<span class="funil-seta-apple"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg></span>`;
 }
 
-function renderCaminho(caminho, idx = 0, isEditMode = false, explicitSlug = "") {
-  const slug = explicitSlug || caminho[0]?.slug || "";
-  const label = caminho.map(n => n.rotulo).join(' \u2192 ');
-  const idsJson = JSON.stringify(caminho.map(n => n.id));
-  const hiddenInputs = caminho.map(n => `<input type="hidden" name="chain_ids[]" value="${n.id}">`).join('');
-  const chipsHtml = caminho.map(renderChip).join(renderSetaApple());
+function renderNivelFunil(nodesAtLevel) {
+  if (!nodesAtLevel || !nodesAtLevel.length) return "";
+  if (nodesAtLevel.length === 1) {
+    return renderChip(nodesAtLevel[0]);
+  }
+  const chips = nodesAtLevel.map(renderChip).join('<span style="font-size:11px;color:#a78bfa;font-weight:700;margin:0 4px" title="Bifurcação">🔀</span>');
+  return `<span class="funil-bif-box" style="display:inline-flex;align-items:center;flex-wrap:wrap;background:rgba(167,139,250,0.08);border:1px dashed rgba(167,139,250,0.35);padding:4px 8px;border-radius:10px">${chips}</span>`;
+}
+
+function renderCaminho(funilLevels, idx = 0, isEditMode = false, explicitSlug = "") {
+  const levels = Array.isArray(funilLevels[0]) ? funilLevels : funilLevels.map(n => [n]);
+  const flatNodes = levels.flat();
+  const slug = explicitSlug || flatNodes[0]?.slug || "";
+  const label = flatNodes.map(n => n.rotulo).join(' \u2192 ');
+  const levelsJson = JSON.stringify(levels.map(lvl => lvl.map(n => n.id)));
+  const allIdsJson = JSON.stringify(flatNodes.map(n => n.id));
+
+  const chipsHtml = levels.map(renderNivelFunil).join(renderSetaApple());
 
   if (!isEditMode) {
     return `<div class="caminho-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
@@ -1061,12 +1126,12 @@ function renderCaminho(caminho, idx = 0, isEditMode = false, explicitSlug = "") 
       ${chipsHtml}
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
-      <button type="button" class="btn-edit-sm" onclick='editarCaminho(${idsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
+      <button type="button" class="btn-edit-sm" onclick='editarFunil(${levelsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
       <form id="form-rem-caminho-${idx}" method="POST" action="/admin/funis/remover-caminho" style="display:none">
         <input type="hidden" name="slug" value="${slug}">
-        ${hiddenInputs}
+        <input type="hidden" name="funil_node_ids" value='${allIdsJson}'>
       </form>
-      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir caminho do funil', '${label.replace(/'/g, "\\'")}')">\u2715 Excluir</button>
+      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir funil mapeado', '${label.replace(/'/g, "\\'")}')">\u2715 Excluir</button>
     </div>
   </div>`;
 }
@@ -1361,19 +1426,83 @@ function renumerarCadeia(){
   var elos=document.querySelectorAll('#chain-builder .chain-elo label');
   elos.forEach(function(lbl, i){ lbl.textContent='Etapa '+(i+1); });
 }
-function editarCaminho(ids){
+function editarFunil(levels){
   var builder=document.getElementById('chain-builder');
   if(!builder) return;
-  var selects=builder.querySelectorAll('select');
-  if(selects.length >= 2 && ids.length >= 2){
-    selects[0].value=ids[0];
-    selects[1].value=ids[1];
-    var rmBtns=builder.querySelectorAll('.btn-chain-rem');
-    rmBtns.forEach(function(b){ b.click(); });
-    for(var i=2; i<ids.length; i++){
-      adicionarElo(ids[i]);
+  if(!Array.isArray(levels[0])) levels = levels.map(function(id){ return [id]; });
+  
+  builder.innerHTML = '';
+  _chainCount = 0;
+  levels.forEach(function(stepIds, idx){
+    if(idx > 0){
+      var arrow=document.createElement('div');
+      arrow.className='chain-arrow';
+      arrow.textContent='\u2192';
+      builder.appendChild(arrow);
     }
-  }
+    _chainCount++;
+    var elo=document.createElement('div');
+    elo.className='chain-elo';
+    elo.id='chain-elo-'+_chainCount;
+    var lbl=document.createElement('label');
+    lbl.textContent='Etapa '+_chainCount;
+    var selWrap=document.createElement('div');
+    selWrap.className='elo-selects';
+    
+    stepIds.forEach(function(nodeId, sIdx){
+      var row=document.createElement('div');
+      row.style.cssText=sIdx===0 ? '' : 'display:flex;align-items:center;gap:4px;margin-top:4px';
+      var sel=document.createElement('select');
+      sel.name='chain_ids[]';
+      sel.innerHTML=_optionsHtml;
+      sel.value=nodeId;
+      if(sIdx===0){
+        selWrap.appendChild(sel);
+      } else {
+        var rm=document.createElement('button');
+        rm.type='button';
+        rm.className='btn-chain-rem';
+        rm.style.padding='2px 6px';
+        rm.textContent='\u2715';
+        rm.onclick=function(){row.remove();};
+        row.appendChild(sel);
+        row.appendChild(rm);
+        selWrap.appendChild(row);
+      }
+    });
+
+    var bifBtn=document.createElement('button');
+    bifBtn.type='button';
+    bifBtn.className='btn-elo-bifurcar';
+    bifBtn.textContent='🔀 Bifurcar';
+    bifBtn.onclick=function(){bifurcarElo(bifBtn);};
+
+    elo.appendChild(lbl);
+    elo.appendChild(selWrap);
+    elo.appendChild(bifBtn);
+
+    if(_chainCount > 2){
+      var remEloBtn=document.createElement('button');
+      remEloBtn.type='button';
+      remEloBtn.className='btn-chain-rem';
+      remEloBtn.textContent='\u2715';
+      remEloBtn.title='Remover esta etapa';
+      remEloBtn.onclick=function(){elo.previousSibling?.remove();elo.remove();renumerarCadeia();};
+      elo.appendChild(remEloBtn);
+    }
+
+    builder.appendChild(elo);
+  });
+
+  var addBtn=document.createElement('button');
+  addBtn.type='button';
+  addBtn.className='btn-chain-add';
+  addBtn.id='btn-chain-add';
+  addBtn.onclick=function(){adicionarElo();};
+  addBtn.textContent='+';
+  addBtn.title='Adicionar próxima etapa na cadeia';
+  builder.appendChild(addBtn);
+
   var card=document.getElementById('card-conectar-etapas');
   if(card){
     card.scrollIntoView({behavior:'smooth',block:'center'});
@@ -1383,6 +1512,7 @@ function editarCaminho(ids){
     setTimeout(function(){ card.style.borderColor=''; card.style.boxShadow=''; }, 1500);
   }
 }
+function editarCaminho(ids){ editarFunil(ids); }
 
 /* ── Modal Apple-style para remover ── */
 var _itemToRemove=null;
@@ -1505,17 +1635,27 @@ app.post("/admin/funis/remover-edge", async (req, res) => {
 });
 
 app.post("/admin/funis/remover-caminho", async (req, res) => {
-  const { slug } = req.body;
-  let chain = req.body.chain_ids;
-  if (!Array.isArray(chain)) chain = chain ? [chain] : [];
-  chain = chain.map(String).filter(Boolean);
+  const { slug, funil_node_ids } = req.body;
+  let ids = [];
+  try {
+    ids = JSON.parse(funil_node_ids || "[]");
+  } catch (e) {}
 
-  if (!slug || chain.length < 2) return res.redirect(`/admin/funis/${slug || ""}`);
+  if (!ids.length && req.body.chain_ids) {
+    let chain = req.body.chain_ids;
+    if (!Array.isArray(chain)) chain = chain ? [chain] : [];
+    ids = chain.map(String).filter(Boolean);
+  }
 
-  const from = chain[chain.length - 2];
-  const to = chain[chain.length - 1];
-  await query(`DELETE FROM funnel_edges WHERE from_node_id=$1 AND to_node_id=$2`, [from, to]);
-  console.log(`[FUNIS] remover-caminho ${from} -> ${to}`);
+  if (!slug || ids.length < 2) return res.redirect(`/admin/funis/${slug || ""}`);
+
+  for (const from of ids) {
+    for (const to of ids) {
+      if (from === to) continue;
+      await query(`DELETE FROM funnel_edges WHERE from_node_id=$1 AND to_node_id=$2`, [from, to]);
+    }
+  }
+  console.log(`[FUNIS] remover-caminho funil unificado:`, ids);
   res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
 });
 
