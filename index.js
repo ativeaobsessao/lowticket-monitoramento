@@ -1039,8 +1039,23 @@ function renderChip(node) {
   </a>`;
 }
 
-function renderCaminho(caminho) {
-  return `<div class="caminho-row">${caminho.map(renderChip).join('<span class="chip-arrow">→</span>')}</div>`;
+function renderCaminho(caminho, idx) {
+  const label = caminho.map(n => n.rotulo).join(' \u2192 ');
+  const idsJson = JSON.stringify(caminho.map(n => n.id));
+  const hiddenInputs = caminho.map(n => `<input type="hidden" name="chain_ids[]" value="${n.id}">`).join('');
+  return `<div class="caminho-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+      ${caminho.map(renderChip).join('<span class="chip-arrow">\u2500\u2500\u2192</span>')}
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
+      <button type="button" class="btn-edit-sm" onclick='editarCaminho(${idsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
+      <form id="form-rem-caminho-${idx}" method="POST" action="/admin/funis/remover-caminho" style="display:none">
+        <input type="hidden" name="slug" value="${caminho[0]?.slug || ''}">
+        ${hiddenInputs}
+      </form>
+      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir caminho do funil', '${label.replace(/'/g, "\\'")}')">\u2715 Excluir</button>
+    </div>
+  </div>`;
 }
 
 // Página de gerenciamento de nós/conexões de um player
@@ -1067,11 +1082,11 @@ app.get("/admin/funis/:slug", async (req, res) => {
       <span class="node-tipo">${info.icon} ${info.label}</span>
       <span class="node-rotulo">${n.rotulo}</span>
       <a href="${n.url}" target="_blank" class="node-url">${n.url.length > 45 ? n.url.slice(0,45)+'...' : n.url}</a>
-      <form method="POST" action="/admin/funis/remover-node" style="display:inline">
+      <form id="form-rem-node-${n.id}" method="POST" action="/admin/funis/remover-node" style="display:none">
         <input type="hidden" name="node_id" value="${n.id}">
         <input type="hidden" name="slug" value="${slug}">
-        <button type="submit" class="btn-del-sm" onclick="return confirm('Remover etapa ${n.rotulo}? Isso também remove as conexões dela.')">✕</button>
       </form>
+      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('node', ${n.id}, 'Remover etapa', '${n.rotulo.replace(/'/g, "\\'")}')">✕</button>
     </div>`;
   }).join("") : '<div class="empty-hint-sm">Nenhuma etapa cadastrada ainda. Crie a primeira acima.</div>';
 
@@ -1092,8 +1107,8 @@ app.get("/admin/funis/:slug", async (req, res) => {
 
   const caminhos = computarCaminhos(nodes, edges);
   const previaCaminhos = caminhos.length
-    ? caminhos.map(renderCaminho).join("")
-    : '<div class="empty-hint-sm">Cadastre etapas e conecte-as para ver os caminhos aqui.</div>';
+    ? caminhos.map((c, idx) => renderCaminho(c, idx)).join("")
+    : '<div class="empty-hint-sm">Cadastre etapas e conecte-as para ver os funis mapeados aqui.</div>';
 
   const msgOk = (() => {
     const q = req.query;
@@ -1140,8 +1155,12 @@ input::placeholder{color:var(--muted)}
 @media(max-width:700px){.form-row,.form-row-edge{grid-template-columns:1fr}.chain-builder{flex-direction:column}}
 .btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;padding:9px 20px;cursor:pointer;white-space:nowrap}
 .btn:hover{opacity:.85}
-.btn-del-sm{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;font-size:10px;padding:2px 6px;cursor:pointer;line-height:1.4;margin-left:8px}
-.btn-del-sm:hover{color:var(--down);border-color:var(--down)}
+.btn-del-sm{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:11px;padding:5px 10px;cursor:pointer;line-height:1.4;transition:all .15s}
+.btn-del-sm:hover{color:var(--down);border-color:var(--down);background:rgba(251,113,133,.08)}
+.btn-edit-sm{background:rgba(167,139,250,.12);color:#a78bfa;border:1px solid rgba(167,139,250,.3);border-radius:6px;font-size:11px;padding:5px 10px;cursor:pointer;line-height:1.4;transition:all .15s;font-weight:600}
+.btn-edit-sm:hover{background:var(--accent);color:#fff}
+.btn-insert-mid{background:transparent;color:var(--accent);border:1px dashed var(--accent);border-radius:5px;font-size:11px;font-weight:700;padding:2px 7px;cursor:pointer;line-height:1.2;transition:all .15s}
+.btn-insert-mid:hover{background:var(--accent);color:#fff}
 .node-row{display:flex;align-items:center;gap:10px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:9px 12px;margin-bottom:8px;flex-wrap:wrap}
 .node-tipo{font-size:11px;font-weight:600;color:#a78bfa;background:rgba(167,139,250,.12);padding:3px 9px;border-radius:5px;white-space:nowrap}
 .node-rotulo{font-size:13px;font-weight:700;color:#fff}
@@ -1175,15 +1194,15 @@ input::placeholder{color:var(--muted)}
 </style>
 </head>
 <body>
-<!-- Modal Apple-style: confirmação de remoção de conexão -->
-<div class="modal-overlay" id="modal-remover-edge" onclick="fecharModalEdgeOverlay(event)">
+<!-- Modal Apple-style universal -->
+<div class="modal-overlay" id="modal-remover-apple" onclick="fecharModalAppleOverlay(event)">
   <div class="modal-card">
     <div class="modal-icon">🗑️</div>
-    <h3 class="modal-title">Remover conexão</h3>
-    <p class="modal-desc" id="modal-edge-desc"></p>
+    <h3 class="modal-title" id="modal-apple-title">Confirmar exclusão</h3>
+    <p class="modal-desc" id="modal-apple-desc"></p>
     <div class="modal-actions">
-      <button class="modal-btn-cancel" onclick="fecharModalEdge()">Cancelar</button>
-      <button class="modal-btn-confirm" onclick="confirmarRemoverEdge()">Remover</button>
+      <button class="modal-btn-cancel" onclick="fecharModalApple()">Cancelar</button>
+      <button class="modal-btn-confirm" onclick="confirmarRemoverApple()">Excluir</button>
     </div>
   </div>
 </div>
@@ -1219,7 +1238,7 @@ ${msgOk}
   ${listaNodes}
 </div>
 
-<div class="card">
+<div class="card" id="card-conectar-etapas">
   <h2>🔗 Conectar etapas</h2>
   ${nodes.length < 2
     ? '<div class="empty-hint-sm">Cadastre pelo menos 2 etapas para poder conectá-las.</div>'
@@ -1247,12 +1266,7 @@ ${msgOk}
 </div>
 
 <div class="card">
-  <h2>🔀 Conexões atuais (${edges.length})</h2>
-  ${listaEdges}
-</div>
-
-<div class="card">
-  <h2>👁 Prévia dos caminhos completos</h2>
+  <h2>✨ FUNIS MAPEADOS (${caminhos.length})</h2>
   ${previaCaminhos}
 </div>
 
@@ -1262,7 +1276,7 @@ var _optionsHtml=(function(){
   var sel=document.querySelector('#chain-builder select');
   return sel?sel.innerHTML:'';
 })();
-function adicionarElo(){
+function adicionarElo(val){
   _chainCount++;
   var builder=document.getElementById('chain-builder');
   var addBtn=document.getElementById('btn-chain-add');
@@ -1277,51 +1291,80 @@ function adicionarElo(){
   var sel=document.createElement('select');
   sel.name='chain_ids[]';
   sel.innerHTML=_optionsHtml;
-  var remWrap=document.createElement('div');
-  remWrap.style.cssText='display:flex;align-items:flex-end;gap:8px';
+  if(val) sel.value=val;
   var remBtn=document.createElement('button');
   remBtn.type='button';
   remBtn.className='btn-chain-rem';
   remBtn.textContent='\u2715';
   remBtn.title='Remover esta etapa';
-  remBtn.onclick=function(){arrow.remove();elo.remove();};
+  remBtn.onclick=function(){arrow.remove();elo.remove();renumerarCadeia();};
   elo.appendChild(lbl);
   elo.appendChild(sel);
   builder.insertBefore(arrow,addBtn);
   builder.insertBefore(elo,addBtn);
-  var remArrow=document.createElement('div');
-  remArrow.className='chain-arrow';
-  remArrow.textContent='';
   builder.insertBefore(remBtn,addBtn);
 }
+function renumerarCadeia(){
+  var elos=document.querySelectorAll('#chain-builder .chain-elo label');
+  elos.forEach(function(lbl, i){ lbl.textContent='Etapa '+(i+1); });
+}
+function editarCaminho(ids){
+  var builder=document.getElementById('chain-builder');
+  if(!builder) return;
+  var selects=builder.querySelectorAll('select');
+  if(selects.length >= 2 && ids.length >= 2){
+    selects[0].value=ids[0];
+    selects[1].value=ids[1];
+    var rmBtns=builder.querySelectorAll('.btn-chain-rem');
+    rmBtns.forEach(function(b){ b.click(); });
+    for(var i=2; i<ids.length; i++){
+      adicionarElo(ids[i]);
+    }
+  }
+  var card=document.getElementById('card-conectar-etapas');
+  if(card){
+    card.scrollIntoView({behavior:'smooth',block:'center'});
+    card.style.transition='box-shadow 0.4s ease, border-color 0.4s ease';
+    card.style.borderColor='var(--accent)';
+    card.style.boxShadow='0 0 0 2px rgba(167,139,250,0.4)';
+    setTimeout(function(){ card.style.borderColor=''; card.style.boxShadow=''; }, 1500);
+  }
+}
 
-/* ── Modal Apple-style para remover conexão ── */
-var _edgeToRemove=null;
-function abrirModalRemover(edgeId,label){
-  _edgeToRemove=edgeId;
-  document.getElementById('modal-edge-desc').textContent=label;
-  var m=document.getElementById('modal-remover-edge');
+/* ── Modal Apple-style para remover ── */
+var _itemToRemove=null;
+function abrirModalRemover(tipo,id,titulo,descricao){
+  _itemToRemove={tipo:tipo, id:id};
+  document.getElementById('modal-apple-title').textContent=titulo;
+  document.getElementById('modal-apple-desc').textContent=descricao;
+  var m=document.getElementById('modal-remover-apple');
   m.classList.add('open');
   document.body.style.overflow='hidden';
 }
-function fecharModalEdge(){
-  var m=document.getElementById('modal-remover-edge');
+function fecharModalApple(){
+  var m=document.getElementById('modal-remover-apple');
   m.classList.remove('open');
   document.body.style.overflow='';
 }
-function fecharModalEdgeOverlay(e){
-  if(e.target===document.getElementById('modal-remover-edge')) fecharModalEdge();
+function fecharModalAppleOverlay(e){
+  if(e.target===document.getElementById('modal-remover-apple')) fecharModalApple();
 }
-function confirmarRemoverEdge(){
-  if(!_edgeToRemove) return;
+function confirmarRemoverApple(){
+  if(!_itemToRemove) return;
   sessionStorage.setItem('funil_scroll_y', window.scrollY);
-  document.getElementById('form-rem-'+_edgeToRemove).submit();
+  var frm = document.getElementById('form-rem-'+_itemToRemove.tipo+'-'+_itemToRemove.id);
+  if(frm) frm.submit();
 }
-/* Restaurar posição do scroll após redirect */
-(function(){
+/* Restaurar posição do scroll após redirect sem pular para o topo */
+function restoreScrollPosition(){
   var y=sessionStorage.getItem('funil_scroll_y');
-  if(y!==null){ window.scrollTo({top:parseInt(y,10),behavior:'instant'}); sessionStorage.removeItem('funil_scroll_y'); }
-})();
+  if(y!==null){
+    window.scrollTo({top:parseInt(y,10),behavior:'instant'});
+    sessionStorage.removeItem('funil_scroll_y');
+  }
+}
+restoreScrollPosition();
+window.addEventListener('DOMContentLoaded', restoreScrollPosition);
 </script>
 </body>
 </html>`);
@@ -1368,6 +1411,21 @@ app.post("/admin/funis/remover-edge", async (req, res) => {
   if (!edge_id) return res.redirect("/admin");
   await query(`DELETE FROM funnel_edges WHERE id=$1`, [edge_id]);
   console.log(`[FUNIS] remover-edge edge_id=${edge_id}`);
+  res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
+});
+
+app.post("/admin/funis/remover-caminho", async (req, res) => {
+  const { slug } = req.body;
+  let chain = req.body.chain_ids;
+  if (!Array.isArray(chain)) chain = chain ? [chain] : [];
+  chain = chain.map(String).filter(Boolean);
+
+  if (!slug || chain.length < 2) return res.redirect(`/admin/funis/${slug || ""}`);
+
+  const from = chain[chain.length - 2];
+  const to = chain[chain.length - 1];
+  await query(`DELETE FROM funnel_edges WHERE from_node_id=$1 AND to_node_id=$2`, [from, to]);
+  console.log(`[FUNIS] remover-caminho ${from} -> ${to}`);
   res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
 });
 
