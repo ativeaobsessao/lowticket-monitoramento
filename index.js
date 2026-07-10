@@ -1128,7 +1128,18 @@ input:focus,select:focus{border-color:var(--accent)}
 input::placeholder{color:var(--muted)}
 .form-row{display:grid;grid-template-columns:180px 160px 1fr auto;gap:10px;align-items:end}
 .form-row-edge{display:grid;grid-template-columns:1fr auto 1fr auto;gap:10px;align-items:end}
-@media(max-width:700px){.form-row,.form-row-edge{grid-template-columns:1fr}}
+.edge-form-layout{display:flex;align-items:flex-start;gap:14px}
+.edge-col-de{flex:1}
+.edge-col-arrow{padding-top:27px;color:var(--muted);font-size:16px;flex-shrink:0}
+.edge-col-para{flex:1;display:flex;flex-direction:column;gap:8px}
+.edge-col-para>label{display:block;margin-bottom:6px}
+.para-row{display:flex;align-items:center;gap:8px}
+.para-row select{flex:1}
+.btn-add-para{background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-size:18px;font-weight:700;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0}
+.btn-add-para:hover{background:var(--accent);color:#fff}
+.btn-rem-para{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:12px;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0}
+.btn-rem-para:hover{color:var(--down);border-color:var(--down)}
+@media(max-width:700px){.form-row,.form-row-edge{grid-template-columns:1fr}.edge-form-layout{flex-direction:column}}
 .btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;padding:9px 20px;cursor:pointer;white-space:nowrap}
 .btn:hover{opacity:.85}
 .btn-del-sm{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;font-size:10px;padding:2px 6px;cursor:pointer;line-height:1.4;margin-left:8px}
@@ -1188,12 +1199,22 @@ ${msgOk}
   <h2>🔗 Conectar etapas</h2>
   ${nodes.length < 2
     ? '<div class="empty-hint-sm">Cadastre pelo menos 2 etapas para poder conectá-las.</div>'
-    : `<form method="POST" action="/admin/funis/add-edge">
+    : `<form method="POST" action="/admin/funis/add-edge" id="form-add-edge">
         <input type="hidden" name="slug" value="${slug}">
-        <div class="form-row-edge">
-          <div class="field"><label>De</label><select name="from_node_id">${optionsNodes}</select></div>
-          <div style="padding-bottom:9px;color:var(--muted);font-size:16px">→</div>
-          <div class="field"><label>Para</label><select name="to_node_id">${optionsNodes}</select></div>
+        <div class="edge-form-layout">
+          <div class="edge-col-de">
+            <div class="field"><label>De</label><select name="from_node_id">${optionsNodes}</select></div>
+          </div>
+          <div class="edge-col-arrow">→</div>
+          <div class="edge-col-para" id="para-list">
+            <label>Para</label>
+            <div class="para-row">
+              <select name="to_node_ids[]">${optionsNodes}</select>
+              <button type="button" class="btn-add-para" onclick="adicionarPara()" title="Adicionar outro destino">+</button>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:14px;display:flex;justify-content:flex-end">
           <button type="submit" class="btn">Conectar</button>
         </div>
       </form>`}
@@ -1209,6 +1230,25 @@ ${msgOk}
   ${previaCaminhos}
 </div>
 
+<script>
+function adicionarPara(){
+  var paraList=document.getElementById('para-list');
+  var firstSel=paraList.querySelector('select');
+  var newRow=document.createElement('div');
+  newRow.className='para-row';
+  var newSel=firstSel.cloneNode(true);
+  newSel.selectedIndex=0;
+  var remBtn=document.createElement('button');
+  remBtn.type='button';
+  remBtn.className='btn-rem-para';
+  remBtn.textContent='\u2715';
+  remBtn.title='Remover este destino';
+  remBtn.onclick=function(){newRow.remove();};
+  newRow.appendChild(newSel);
+  newRow.appendChild(remBtn);
+  paraList.appendChild(newRow);
+}
+</script>
 </body>
 </html>`);
 });
@@ -1231,11 +1271,19 @@ app.post("/admin/funis/remover-node", async (req, res) => {
 });
 
 app.post("/admin/funis/add-edge", async (req, res) => {
-  const { slug, from_node_id, to_node_id } = req.body;
-  if (!slug || !from_node_id || !to_node_id) return res.redirect(`/admin/funis/${slug || ""}`);
-  if (from_node_id === to_node_id) return res.redirect(`/admin/funis/${slug}?erro=mesma-etapa`);
-  await query(`INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1,$2)`, [from_node_id, to_node_id]);
-  console.log(`[FUNIS] add-edge ${from_node_id} -> ${to_node_id}`);
+  const { slug, from_node_id } = req.body;
+  // Aceita to_node_ids[] (multi-destino, novo) com fallback para to_node_id (legado/compat.)
+  let toIds = req.body.to_node_ids ?? req.body.to_node_id;
+  if (!Array.isArray(toIds)) toIds = toIds ? [toIds] : [];
+  toIds = toIds.filter(Boolean);
+
+  if (!slug || !from_node_id || toIds.length === 0) return res.redirect(`/admin/funis/${slug || ""}`);
+
+  for (const to_node_id of toIds) {
+    if (from_node_id === to_node_id) return res.redirect(`/admin/funis/${slug}?erro=mesma-etapa`);
+    await query(`INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1,$2)`, [from_node_id, to_node_id]);
+    console.log(`[FUNIS] add-edge ${from_node_id} -> ${to_node_id}`);
+  }
   res.redirect(`/admin/funis/${slug}?ok=edge-add`);
 });
 
