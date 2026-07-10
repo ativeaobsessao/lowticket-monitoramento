@@ -1039,18 +1039,31 @@ function renderChip(node) {
   </a>`;
 }
 
-function renderCaminho(caminho, idx) {
+function renderSetaApple() {
+  return `<span class="funil-seta-apple"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg></span>`;
+}
+
+function renderCaminho(caminho, idx = 0, isEditMode = false, explicitSlug = "") {
+  const slug = explicitSlug || caminho[0]?.slug || "";
   const label = caminho.map(n => n.rotulo).join(' \u2192 ');
   const idsJson = JSON.stringify(caminho.map(n => n.id));
   const hiddenInputs = caminho.map(n => `<input type="hidden" name="chain_ids[]" value="${n.id}">`).join('');
+  const chipsHtml = caminho.map(renderChip).join(renderSetaApple());
+
+  if (!isEditMode) {
+    return `<div class="caminho-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+      ${chipsHtml}
+    </div>`;
+  }
+
   return `<div class="caminho-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
     <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
-      ${caminho.map(renderChip).join('<span class="chip-arrow">\u2500\u2500\u2192</span>')}
+      ${chipsHtml}
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
       <button type="button" class="btn-edit-sm" onclick='editarCaminho(${idsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
       <form id="form-rem-caminho-${idx}" method="POST" action="/admin/funis/remover-caminho" style="display:none">
-        <input type="hidden" name="slug" value="${caminho[0]?.slug || ''}">
+        <input type="hidden" name="slug" value="${slug}">
         ${hiddenInputs}
       </form>
       <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir caminho do funil', '${label.replace(/'/g, "\\'")}')">\u2715 Excluir</button>
@@ -1107,7 +1120,7 @@ app.get("/admin/funis/:slug", async (req, res) => {
 
   const caminhos = computarCaminhos(nodes, edges);
   const previaCaminhos = caminhos.length
-    ? caminhos.map((c, idx) => renderCaminho(c, idx)).join("")
+    ? caminhos.map((c, idx) => renderCaminho(c, idx, true, slug)).join("")
     : '<div class="empty-hint-sm">Cadastre etapas e conecte-as para ver os funis mapeados aqui.</div>';
 
   const msgOk = (() => {
@@ -1146,7 +1159,12 @@ input::placeholder{color:var(--muted)}
 .form-row{display:grid;grid-template-columns:180px 160px 1fr auto;gap:10px;align-items:end}
 .form-row-edge{display:grid;grid-template-columns:1fr auto 1fr auto;gap:10px;align-items:end}
 .chain-builder{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px}
-.chain-elo{display:flex;flex-direction:column;gap:6px;min-width:160px;flex:1}
+.chain-elo{display:flex;flex-direction:column;gap:6px;min-width:165px;flex:1}
+.elo-selects{display:flex;flex-direction:column;gap:6px}
+.btn-elo-bifurcar{background:transparent;color:#a78bfa;border:1px dashed rgba(167,139,250,0.35);border-radius:6px;font-size:11px;font-weight:600;padding:5px 8px;cursor:pointer;margin-top:2px;width:100%;transition:all .15s}
+.btn-elo-bifurcar:hover{background:rgba(167,139,250,0.12);border-color:#a78bfa;color:#fff}
+.funil-seta-apple{display:inline-flex;align-items:center;color:#a78bfa;margin:0 5px;opacity:0.85}
+.funil-seta-apple svg{display:block;filter:drop-shadow(0 0 4px rgba(167,139,250,0.4))}
 .chain-arrow{color:var(--muted);font-size:16px;padding-bottom:10px;flex-shrink:0}
 .btn-chain-add{background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-size:18px;font-weight:700;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0;margin-bottom:1px}
 .btn-chain-add:hover{background:var(--accent);color:#fff}
@@ -1247,15 +1265,22 @@ ${msgOk}
         <div style="font-size:11px;color:var(--muted);margin-bottom:12px;line-height:1.5">
           Monte a sequência completa do funil. Cada etapa conecta à próxima em cadeia.
         </div>
+        <input type="hidden" name="chain_steps_json" id="chain_steps_json">
         <div class="chain-builder" id="chain-builder">
           <div class="chain-elo">
             <label>Etapa 1</label>
-            <select name="chain_ids[]">${optionsNodes}</select>
+            <div class="elo-selects">
+              <select name="chain_ids[]">${optionsNodes}</select>
+            </div>
+            <button type="button" class="btn-elo-bifurcar" onclick="bifurcarElo(this)" title="Adicionar bifurcação nesta etapa">🔀 Bifurcar</button>
           </div>
           <div class="chain-arrow" id="chain-arrow-1">→</div>
           <div class="chain-elo" id="chain-elo-2">
             <label>Etapa 2</label>
-            <select name="chain_ids[]">${optionsNodes}</select>
+            <div class="elo-selects">
+              <select name="chain_ids[]">${optionsNodes}</select>
+            </div>
+            <button type="button" class="btn-elo-bifurcar" onclick="bifurcarElo(this)" title="Adicionar bifurcação nesta etapa">🔀 Bifurcar</button>
           </div>
           <button type="button" class="btn-chain-add" id="btn-chain-add" onclick="adicionarElo()" title="Adicionar próxima etapa na cadeia">+</button>
         </div>
@@ -1288,10 +1313,19 @@ function adicionarElo(val){
   elo.id='chain-elo-'+_chainCount;
   var lbl=document.createElement('label');
   lbl.textContent='Etapa '+_chainCount;
+  var selWrap=document.createElement('div');
+  selWrap.className='elo-selects';
   var sel=document.createElement('select');
   sel.name='chain_ids[]';
   sel.innerHTML=_optionsHtml;
   if(val) sel.value=val;
+  selWrap.appendChild(sel);
+  var bifBtn=document.createElement('button');
+  bifBtn.type='button';
+  bifBtn.className='btn-elo-bifurcar';
+  bifBtn.textContent='🔀 Bifurcar';
+  bifBtn.title='Adicionar bifurcação nesta etapa';
+  bifBtn.onclick=function(){bifurcarElo(bifBtn);};
   var remBtn=document.createElement('button');
   remBtn.type='button';
   remBtn.className='btn-chain-rem';
@@ -1299,10 +1333,29 @@ function adicionarElo(val){
   remBtn.title='Remover esta etapa';
   remBtn.onclick=function(){arrow.remove();elo.remove();renumerarCadeia();};
   elo.appendChild(lbl);
-  elo.appendChild(sel);
+  elo.appendChild(selWrap);
+  elo.appendChild(bifBtn);
   builder.insertBefore(arrow,addBtn);
   builder.insertBefore(elo,addBtn);
   builder.insertBefore(remBtn,addBtn);
+}
+function bifurcarElo(btnEl){
+  var elo=btnEl.closest('.chain-elo');
+  var wrap=elo.querySelector('.elo-selects');
+  var row=document.createElement('div');
+  row.style.cssText='display:flex;align-items:center;gap:4px;margin-top:4px';
+  var sel=document.createElement('select');
+  sel.name='chain_ids[]';
+  sel.innerHTML=_optionsHtml;
+  var rm=document.createElement('button');
+  rm.type='button';
+  rm.className='btn-chain-rem';
+  rm.style.padding='2px 6px';
+  rm.textContent='\u2715';
+  rm.onclick=function(){row.remove();};
+  row.appendChild(sel);
+  row.appendChild(rm);
+  wrap.appendChild(row);
 }
 function renumerarCadeia(){
   var elos=document.querySelectorAll('#chain-builder .chain-elo label');
@@ -1364,7 +1417,26 @@ function restoreScrollPosition(){
   }
 }
 restoreScrollPosition();
-window.addEventListener('DOMContentLoaded', restoreScrollPosition);
+window.addEventListener('DOMContentLoaded', function(){
+  restoreScrollPosition();
+  var frm = document.getElementById('form-add-edge');
+  if(frm){
+    frm.addEventListener('submit', function(){
+      var elos = document.querySelectorAll('#chain-builder .chain-elo');
+      var steps = [];
+      elos.forEach(function(elo){
+        var selects = elo.querySelectorAll('select');
+        var ids = [];
+        selects.forEach(function(s){
+          if(s.value && ids.indexOf(s.value) === -1) ids.push(s.value);
+        });
+        if(ids.length > 0) steps.push(ids);
+      });
+      var hidden = document.getElementById('chain_steps_json');
+      if(hidden) hidden.value = JSON.stringify(steps);
+    });
+  }
+});
 </script>
 </body>
 </html>`);
@@ -1388,20 +1460,38 @@ app.post("/admin/funis/remover-node", async (req, res) => {
 });
 
 app.post("/admin/funis/add-edge", async (req, res) => {
-  const { slug } = req.body;
-  // chain_ids[]: array ordenado de IDs — cria arestas entre pares consecutivos
-  let chain = req.body.chain_ids;
-  if (!Array.isArray(chain)) chain = chain ? [chain] : [];
-  chain = chain.map(String).filter(Boolean);
+  const { slug, chain_steps_json } = req.body;
+  if (!slug) return res.redirect("/admin");
 
-  if (!slug || chain.length < 2) return res.redirect(`/admin/funis/${slug || ""}`);
+  let steps = [];
+  try {
+    steps = JSON.parse(chain_steps_json || "[]");
+  } catch (e) {}
 
-  for (let i = 0; i < chain.length - 1; i++) {
-    const from = chain[i];
-    const to   = chain[i + 1];
-    if (from === to) return res.redirect(`/admin/funis/${slug}?erro=mesma-etapa`);
-    await query(`INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1,$2)`, [from, to]);
-    console.log(`[FUNIS] add-edge (cadeia) ${from} -> ${to}`);
+  if (!steps.length && req.body.chain_ids) {
+    let chain = req.body.chain_ids;
+    if (!Array.isArray(chain)) chain = chain ? [chain] : [];
+    steps = chain.map(id => [String(id)]).filter(arr => arr[0]);
+  }
+
+  if (steps.length < 2) return res.redirect(`/admin/funis/${slug}?erro=sem-etapas`);
+
+  for (let i = 0; i < steps.length - 1; i++) {
+    const fromNodes = steps[i];
+    const toNodes = steps[i + 1];
+    for (const from of fromNodes) {
+      for (const to of toNodes) {
+        if (from === to) continue;
+        const { rows: exist } = await query(
+          `SELECT id FROM funnel_edges WHERE from_node_id=$1 AND to_node_id=$2 LIMIT 1`,
+          [from, to]
+        );
+        if (!exist.length) {
+          await query(`INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1,$2)`, [from, to]);
+          console.log(`[FUNIS] add-edge ${from} -> ${to}`);
+        }
+      }
+    }
   }
   res.redirect(`/admin/funis/${slug}?ok=edge-add`);
 });
@@ -1538,7 +1628,7 @@ app.get("/funis", async (_req, res) => {
         <a href="/admin/funis/${p.slug}" class="player-edit-link">✏️ Editar</a>
       </div>
       <div class="player-caminhos">
-        ${p.caminhos.map(renderCaminho).join("")}
+        ${p.caminhos.map((c, idx) => renderCaminho(c, idx, false)).join("")}
       </div>
     </div>`).join("");
 
