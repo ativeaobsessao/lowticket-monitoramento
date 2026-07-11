@@ -1974,9 +1974,15 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:0 0 8px var(--up)}
 .section-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:0 0 12px 2px;display:flex;align-items:center;gap:8px}
 .scaling-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:26px}
-.scale-card{background:linear-gradient(135deg,#1a1530,#14122a);border:1px solid #2e2658;border-radius:14px;padding:16px 18px;position:relative;overflow:hidden}
-.scale-card-rank{position:absolute;top:12px;right:14px;font-size:11px;color:var(--muted);font-family:'Space Mono',monospace}
-.scale-card-name{font-size:13px;font-weight:600;color:#fff;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:24px}
+.scale-card{background:linear-gradient(135deg,#1a1530,#14122a);border:1px solid #2e2658;border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;cursor:pointer;transition:all 0.25s cubic-bezier(0.16,1,0.3,1)}
+.scale-card:hover{border-color:var(--accent);box-shadow:0 8px 24px -6px rgba(124,111,255,0.35);transform:translateY(-2px)}
+.scale-card:active{transform:scale(0.982)}
+.scale-arrow{display:inline-block;transition:transform 0.25s ease, color 0.25s ease;font-weight:700;margin-left:4px}
+.scale-card:hover .scale-arrow{transform:translate(2px,-2px);color:var(--accent)}
+.scale-card-toast{position:absolute;inset:0;background:rgba(18,18,31,0.92);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;gap:8px;color:#34d399;font-weight:700;font-size:14px;border-radius:14px;opacity:0;transform:scale(0.92);pointer-events:none;transition:all 0.25s cubic-bezier(0.16,1,0.3,1);z-index:10}
+.scale-card-toast.show{opacity:1;transform:scale(1)}
+.scale-card-rank{position:absolute;top:12px;right:14px;font-size:11px;color:var(--muted);font-family:'Space Mono',monospace;display:flex;align-items:center}
+.scale-card-name{font-size:13px;font-weight:600;color:#fff;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:34px}
 .scale-card-val{font-size:30px;font-weight:700;color:#fff;font-family:'Space Mono',monospace;line-height:1}
 .scale-card-meta{display:flex;align-items:center;gap:10px;margin-top:8px;font-size:12px}
 .scale-pct{font-weight:600;font-family:'Space Mono',monospace}
@@ -2233,7 +2239,36 @@ if(escalando.length===0){
   escalando.forEach((x,i)=>{
     const card=document.createElement("div");
     card.className="scale-card";
-    card.innerHTML='<div class="scale-card-rank">#'+(i+1)+'</div>'
+    const urlBib = ultima[x.p]?.url || "";
+    card.title = "Clique para copiar o link e abrir a biblioteca de " + x.p;
+    card.onclick = function() {
+      if (urlBib) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(urlBib).catch(()=>{});
+        } else {
+          const ta = document.createElement("textarea");
+          ta.value = urlBib;
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand("copy"); } catch(e){}
+          document.body.removeChild(ta);
+        }
+        window.open(urlBib, "_blank", "noopener");
+      }
+      let oldToast = card.querySelector(".scale-card-toast");
+      if (oldToast) oldToast.remove();
+      const toast = document.createElement("div");
+      toast.className = "scale-card-toast";
+      toast.innerHTML = '<span style="font-size:16px">✓</span> Link copiado!';
+      card.appendChild(toast);
+      void toast.offsetWidth;
+      toast.classList.add("show");
+      setTimeout(()=>{
+        toast.classList.remove("show");
+        setTimeout(()=>{ toast.remove(); }, 300);
+      }, 2000);
+    };
+    card.innerHTML='<div class="scale-card-rank">#'+(i+1)+' <span class="scale-arrow">↗</span></div>'
       +'<div class="scale-card-name">'+x.p+'</div>'
       +'<div class="scale-card-val">'+x.at.toLocaleString("pt-BR")+'</div>'
       +'<div class="scale-card-meta"><span class="scale-pct" style="color:'+x.color+'">'+(x.pct>=0?"+":"")+x.pct+'%</span>'
