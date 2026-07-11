@@ -1062,7 +1062,26 @@ function computarCaminhos(nodes, edges) {
       else levels.push(remaining);
     }
 
-    funisMapeados.push(levels);
+    function buildTree(id, treeVisited = new Set()) {
+      if (treeVisited.has(id)) return null;
+      treeVisited.add(id);
+      const node = nodesById[id];
+      if (!node) return null;
+      const childrenIds = (adjOut[id] || []).filter(nxt => compSet.has(nxt));
+      const children = childrenIds
+        .map(cid => buildTree(cid, new Set(treeVisited)))
+        .filter(Boolean);
+      return { node, children };
+    }
+
+    const rootTrees = raizes.map(rid => buildTree(rid)).filter(Boolean);
+    const mainTree = rootTrees.length === 1 ? rootTrees[0] : { node: null, children: rootTrees };
+
+    funisMapeados.push({
+      tree: mainTree,
+      levels: levels,
+      allNodes: comp.map(id => nodesById[id]).filter(Boolean)
+    });
   });
 
   return funisMapeados;
@@ -1086,46 +1105,85 @@ async function getNodesEdges(slug) {
 
 function renderChip(node) {
   const info = TIPO_INFO[node.tipo] || { icon: "🔗", label: node.tipo };
-  return `<a href="${node.url}" target="_blank" rel="noopener" class="chip">
+  return `<a href="${node.url}" target="_blank" rel="noopener" class="chip" title="Abrir ${node.rotulo} em nova guia">
     <span class="chip-icon">${info.icon}</span>
     <span class="chip-label">${node.rotulo}</span>
   </a>`;
 }
 
-function renderSetaApple() {
-  return `<span class="funil-seta-apple"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg></span>`;
+function renderNotionLinearConnector() {
+  return `<span class="flow-notion-arrow" style="display:inline-flex;align-items:center;margin:0 6px;flex-shrink:0">
+    <svg width="24" height="12" viewBox="0 0 24 12" fill="none">
+      <line x1="0" y1="6" x2="18" y2="6" stroke="#7c6fff" stroke-width="2" stroke-linecap="round"/>
+      <path d="M15 2L20 6L15 10" stroke="#7c6fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </span>`;
 }
 
-function renderNivelFunil(nodesAtLevel) {
-  if (!nodesAtLevel || !nodesAtLevel.length) return "";
-  if (nodesAtLevel.length === 1) {
-    return renderChip(nodesAtLevel[0]);
+function renderNotionBranchConnector() {
+  return `<span class="flow-branch-arrow" style="display:inline-flex;align-items:center;margin-right:6px;flex-shrink:0">
+    <svg width="10" height="12" viewBox="0 0 10 12" fill="none">
+      <path d="M1 2L6 6L1 10" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </span>`;
+}
+
+function renderTreeNode(treeNode) {
+  if (!treeNode) return "";
+  if (!treeNode.node && treeNode.children) {
+    return treeNode.children.map(renderTreeNode).join("");
   }
-  const chips = nodesAtLevel.map(renderChip).join('<span style="font-size:11px;color:#a78bfa;font-weight:700;margin:0 4px" title="Bifurcação">🔀</span>');
-  return `<span class="funil-bif-box" style="display:inline-flex;align-items:center;flex-wrap:wrap;background:rgba(167,139,250,0.08);border:1px dashed rgba(167,139,250,0.35);padding:4px 8px;border-radius:10px">${chips}</span>`;
+  const chipHtml = renderChip(treeNode.node);
+  if (!treeNode.children || treeNode.children.length === 0) {
+    return `<div class="flow-tree-node">${chipHtml}</div>`;
+  }
+  if (treeNode.children.length === 1) {
+    return `<div class="flow-tree-node">${chipHtml}<div class="flow-linear-branch">${renderNotionLinearConnector()}${renderTreeNode(treeNode.children[0])}</div></div>`;
+  }
+  const branchesHtml = treeNode.children.map(child => `
+    <div class="flow-tree-branch">
+      ${renderNotionBranchConnector()}
+      <div class="flow-branch-content">
+        ${renderTreeNode(child)}
+      </div>
+    </div>
+  `).join("");
+
+  return `<div class="flow-tree-node">${chipHtml}<div class="flow-tree-branches">${branchesHtml}</div></div>`;
 }
 
-function renderCaminho(funilLevels, idx = 0, isEditMode = false, explicitSlug = "") {
-  const levels = Array.isArray(funilLevels[0]) ? funilLevels : funilLevels.map(n => [n]);
-  const flatNodes = levels.flat();
-  const slug = explicitSlug || flatNodes[0]?.slug || "";
-  const label = flatNodes.map(n => n.rotulo).join(' \u2192 ');
-  const levelsJson = JSON.stringify(levels.map(lvl => lvl.map(n => n.id)));
-  const allIdsJson = JSON.stringify(flatNodes.map(n => n.id));
+function renderCaminho(funilItem, idx = 0, isEditMode = false, explicitSlug = "") {
+  let tree, levels, allNodes;
+  if (funilItem && funilItem.tree) {
+    tree = funilItem.tree;
+    levels = funilItem.levels;
+    allNodes = funilItem.allNodes;
+  } else if (Array.isArray(funilItem)) {
+    levels = Array.isArray(funilItem[0]) ? funilItem : funilItem.map(n => [n]);
+    allNodes = levels.flat();
+    tree = { node: allNodes[0], children: [] };
+  } else {
+    return "";
+  }
 
-  const chipsHtml = levels.map(renderNivelFunil).join(renderSetaApple());
+  const slug = explicitSlug || allNodes[0]?.slug || "";
+  const label = allNodes.map(n => n.rotulo).join(' \u2192 ');
+  const levelsJson = JSON.stringify(levels.map(lvl => lvl.map(n => n.id)));
+  const allIdsJson = JSON.stringify(allNodes.map(n => n.id));
+
+  const treeHtml = renderTreeNode(tree);
 
   if (!isEditMode) {
-    return `<div class="caminho-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
-      ${chipsHtml}
+    return `<div class="caminho-row flow-row-container" style="display:flex;align-items:center;overflow-x:auto;padding:14px 16px">
+      ${treeHtml}
     </div>`;
   }
 
-  return `<div class="caminho-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
-      ${chipsHtml}
+  return `<div class="caminho-row flow-row-container" style="display:flex;align-items:center;justify-content:space-between;gap:16px;overflow-x:auto;padding:14px 16px">
+    <div style="display:flex;align-items:center">
+      ${treeHtml}
     </div>
-    <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
+    <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0">
       <button type="button" class="btn-edit-sm" onclick='editarFunil(${levelsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
       <form id="form-rem-caminho-${idx}" method="POST" action="/admin/funis/remover-caminho" style="display:none">
         <input type="hidden" name="slug" value="${slug}">
@@ -1255,6 +1313,14 @@ input::placeholder{color:var(--muted)}
 .chip-icon{font-size:13px}
 .chip-arrow{color:var(--muted);font-size:15px;font-weight:700;margin:0 2px}
 .caminho-row{display:flex;align-items:center;flex-wrap:wrap;gap:2px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.flow-tree-node{display:inline-flex;align-items:center}
+.flow-linear-branch{display:inline-flex;align-items:center}
+.flow-tree-branches{display:flex;flex-direction:column;justify-content:center;gap:12px;position:relative;margin-left:8px;padding-left:18px}
+.flow-tree-branches::before{content:'';position:absolute;left:0;top:16px;bottom:16px;width:2px;background:rgba(167,139,250,0.45);border-radius:2px}
+.flow-tree-branch{display:inline-flex;align-items:center;position:relative}
+.flow-tree-branch::before{content:'';position:absolute;left:-18px;top:50%;width:12px;height:2px;background:rgba(167,139,250,0.45)}
+.flow-branch-content{display:inline-flex;align-items:center}
+.flow-row-container{min-height:54px}
 .empty-hint-sm{color:var(--muted);font-size:12px;text-align:center;padding:16px;border:1px dashed var(--border);border-radius:8px}
 .msg{padding:11px 14px;border-radius:8px;font-size:13px;margin-bottom:16px}
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
@@ -1806,6 +1872,14 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
 .player-edit-link:hover{background:var(--accent);color:#fff}
 .player-caminhos{display:flex;flex-direction:column;gap:8px}
 .caminho-row{display:flex;align-items:center;flex-wrap:wrap;gap:2px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.flow-tree-node{display:inline-flex;align-items:center}
+.flow-linear-branch{display:inline-flex;align-items:center}
+.flow-tree-branches{display:flex;flex-direction:column;justify-content:center;gap:12px;position:relative;margin-left:8px;padding-left:18px}
+.flow-tree-branches::before{content:'';position:absolute;left:0;top:16px;bottom:16px;width:2px;background:rgba(167,139,250,0.45);border-radius:2px}
+.flow-tree-branch{display:inline-flex;align-items:center;position:relative}
+.flow-tree-branch::before{content:'';position:absolute;left:-18px;top:50%;width:12px;height:2px;background:rgba(167,139,250,0.45)}
+.flow-branch-content{display:inline-flex;align-items:center}
+.flow-row-container{min-height:54px}
 .chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff}
 .chip:hover{border-color:var(--accent)}
 .chip-icon{font-size:13px}
