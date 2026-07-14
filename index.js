@@ -1955,7 +1955,9 @@ app.get("/dashboard", async (_req, res) => {
         ultimaLeitura[p.nome] = {
           ads:          latestRow ? latestRow.ads_count : hist[hist.length - 1].ads_count,
           url:          p.url,
-          ultimaColeta: latestRow ? toBrDate(latestRow.collected_at).toISOString() : null,
+          ultimaColeta: latestRow
+            ? new Date(latestRow.collected_at).toISOString()
+            : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
