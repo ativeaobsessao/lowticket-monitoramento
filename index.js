@@ -774,12 +774,6 @@ ${msgOk}
         <input type="text" name="nicho" id="nichoInput" placeholder="Ex: Próstata, Weight Loss, ED">
       </div>
     </div>
-    <div class="form-row-3">
-      <div class="field">
-        <label>Funil <span class="label-optional">opcional</span></label>
-        <input type="text" name="funil" id="funilInput" placeholder="Ex: VSL, Advertorial, Quiz">
-      </div>
-    </div>
 
     <div style="display:flex;gap:10px;margin-top:4px">
       <button type="submit" class="btn" id="submitBtn">Cadastrar</button>
@@ -853,7 +847,6 @@ function editarItem(btn){
   document.getElementById('instagramInput').value=btn.dataset.instagram;
   document.getElementById('geoInput').value=btn.dataset.geo;
   document.getElementById('nichoInput').value=btn.dataset.nicho;
-  document.getElementById('funilInput').value=btn.dataset.funil;
   document.getElementById('form-title').textContent='✏️ Editando: '+btn.dataset.nome;
   document.getElementById('submitBtn').textContent='Salvar alterações';
   document.getElementById('cancelBtn').style.display='inline-block';
