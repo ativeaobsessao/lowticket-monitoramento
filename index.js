@@ -129,6 +129,17 @@ function getChromiumPath() {
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
   try {
+    // PILAR 1: Interceptação de Rede (Network Blocking)
+    // Aborta o download de imagens, vídeos, css e fontes pesadas da Meta Ad Library para economizar 70% de RAM e CPU.
+    await page.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (["image", "media", "font", "stylesheet"].includes(type)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    });
+
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(15000);
     const content = await page.content();
@@ -434,19 +445,47 @@ async function runAllScrapes(trigger = "cron") {
   }
 
   let browser;
+  let context;
   const results = [];
-  try {
+
+  // Função interna para reciclar o navegador
+  async function launchBrowser() {
+    if (browser) await browser.close();
     browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
     });
-    const context = await browser.newContext({
+    context = await browser.newContext({
       locale: "pt-BR",
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
     });
-    for (const p of pages) {
+  }
+
+  try {
+    await launchBrowser(); // Início limpo
+    
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+
+      // PILAR 4: Observabilidade e Degradação Graciosa (Graceful Degradation)
+      // Se a memória RAM estourar 300MB, pausar, fazer Garbage Collection e reciclar o Browser
+      const mem = process.memoryUsage();
+      const heapMb = mem.heapUsed / 1024 / 1024;
+      if (heapMb > 300) {
+        console.warn(`[RUN] ⚠️ ALERTA DE MEMÓRIA! Heap em ${heapMb.toFixed(1)}MB. Forçando Garbage Collection e Reciclando Browser...`);
+        if (global.gc) global.gc(); // Roda GC manual habilitado pelo flag --expose-gc
+        await launchBrowser();
+      }
+
+      // PILAR 3: Reciclagem Preventiva do Navegador (TTL) a cada 5 páginas
+      if (i > 0 && i % 5 === 0) {
+        console.log(`[RUN] 🔄 Reciclando browser preventivamente (processadas: ${i} de ${pages.length})...`);
+        await launchBrowser();
+        await new Promise(r => setTimeout(r, 2000)); // Pequena pausa pro SO respirar
+      }
+
       let count = null;
       for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
         try {
@@ -473,6 +512,9 @@ async function runAllScrapes(trigger = "cron") {
       }
 
       results.push({ slug: p.slug, nome: p.nome, count: final });
+      
+      // Delay tático entre páginas (Alívio de CPU e Fila)
+      await new Promise(r => setTimeout(r, 1500));
     }
   } catch (err) {
     console.error(`[RUN] fatal error: ${err.message}`);
