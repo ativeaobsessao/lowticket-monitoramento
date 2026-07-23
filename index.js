@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
 import { execSync } from "child_process";
-import cron from "node-cron";
 import pg from "pg";
 
 const { Pool } = pg;
@@ -428,27 +427,19 @@ function parseLoteInput(texto) {
   return itens;
 }
 
-async function runAllScrapes(trigger = "cron") {
-  if (isRunning) {
-    console.warn(`[RUN] skipped (${trigger}) — already running`);
-    return { skipped: true };
-  }
-  isRunning = true;
-  const startedAt = new Date();
-  console.log(`[RUN] ===== started (${trigger}) at ${startedAt.toISOString()} =====`);
+function getCurrentSlot() {
+  const now = new Date();
+  const hour = now.getUTCHours();
+  if (hour >= 1 && hour < 6) return "cron-22h";
+  if (hour >= 6 && hour < 15) return "cron-03h";
+  return "cron-12h";
+}
 
-  const { rows: pages } = await query("SELECT slug, nome, url FROM pages");
-  if (!pages.length) {
-    console.log("[RUN] no pages registered");
-    isRunning = false;
-    return { pages: 0 };
-  }
-
+async function processBatch(pages, slot) {
   let browser;
   let context;
   const results = [];
 
-  // Função interna para reciclar o navegador
   async function launchBrowser() {
     if (browser) await browser.close();
     browser = await chromium.launch({
@@ -469,69 +460,72 @@ async function runAllScrapes(trigger = "cron") {
     for (let i = 0; i < pages.length; i++) {
       const p = pages[i];
 
-      // PILAR 4: Observabilidade e Degradação Graciosa (Graceful Degradation)
-      // Se a memória RAM estourar 300MB, pausar, fazer Garbage Collection e reciclar o Browser
-      const mem = process.memoryUsage();
-      const heapMb = mem.heapUsed / 1024 / 1024;
-      if (heapMb > 300) {
-        console.warn(`[RUN] ⚠️ ALERTA DE MEMÓRIA! Heap em ${heapMb.toFixed(1)}MB. Forçando Garbage Collection e Reciclando Browser...`);
-        if (global.gc) global.gc(); // Roda GC manual habilitado pelo flag --expose-gc
-        await launchBrowser();
-      }
-
-      // PILAR 3: Reciclagem Preventiva do Navegador (TTL) a cada 5 páginas
-      if (i > 0 && i % 5 === 0) {
-        console.log(`[RUN] 🔄 Reciclando browser preventivamente (processadas: ${i} de ${pages.length})...`);
-        await launchBrowser();
-        await new Promise(r => setTimeout(r, 2000)); // Pequena pausa pro SO respirar
-      }
-
       let count = null;
       for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
         try {
           count = await scrapeWithContext(context, p.url);
         } catch (err) {
-          console.error(`[RUN] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+          console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
         }
       }
       const final = count ?? 0;
 
-      if (trigger.startsWith("cron")) {
-        const slot = resolveSlot(trigger);
-        await saveCount(p.slug, final, slot);
-      } else {
-        await query(
-          `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-           VALUES ($1, $2, NOW())
-           ON CONFLICT (slug) DO UPDATE
-             SET ads_count    = EXCLUDED.ads_count,
-                 collected_at = EXCLUDED.collected_at`,
-          [p.slug, final]
-        );
-        console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
-      }
-
+      await saveCount(p.slug, final, slot);
       results.push({ slug: p.slug, nome: p.nome, count: final });
       
-      // Delay tático entre páginas (Alívio de CPU e Fila)
+      // Delay tático entre páginas
       await new Promise(r => setTimeout(r, 1500));
     }
   } catch (err) {
-    console.error(`[RUN] fatal error: ${err.message}`);
+    console.error(`[BATCH] fatal error: ${err.message}`);
   } finally {
     if (browser) await browser.close();
-    isRunning = false;
   }
 
-  await mirrorToSheet(results);
-  const secs = Math.round((Date.now() - startedAt.getTime()) / 1000);
-  console.log(`[RUN] ===== finished (${trigger}) — ${results.length} pages in ${secs}s =====`);
-  return { pages: results.length, durationSec: secs, results };
+  if (results.length > 0) {
+    await mirrorToSheet(results);
+  }
+  return results;
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
+
+app.get("/api/cron/tick", async (req, res) => {
+  res.json({ status: "alive", message: "Tick received" });
+  
+  if (isRunning) return;
+  isRunning = true;
+  
+  try {
+    const slot = getCurrentSlot();
+    const { rows: pages } = await query(`
+      SELECT p.slug, p.nome, p.url
+      FROM pages p
+      WHERE NOT EXISTS (
+        SELECT 1 FROM scrape_history sh 
+        WHERE sh.slug = p.slug 
+          AND sh.slot = $1 
+          AND sh.created_at >= NOW() - INTERVAL '8 hours'
+      )
+      LIMIT 5;
+    `, [slot]);
+
+    if (pages.length === 0) {
+      isRunning = false;
+      return;
+    }
+
+    console.log(`[TICK] Iniciando lote de ${pages.length} paginas para o slot ${slot}...`);
+    await processBatch(pages, slot);
+    console.log(`[TICK] Lote do slot ${slot} finalizado.`);
+  } catch (err) {
+    console.error("[TICK] Erro geral:", err);
+  } finally {
+    isRunning = false;
+  }
+});
 
 app.post("/api/salvar", async (req, res) => {
   const { nome, url, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
@@ -2536,11 +2530,8 @@ render(D_DOM,HD_DOM,"dom_");
 
 // ─── Scheduler ───────────────────────────────────────────────────────────────
 
-// Cron em UTC explícito: 03h BR=06h UTC | 12h BR=15h UTC | 22h BR=01h UTC
-cron.schedule("0 6 * * *",  () => runAllScrapes("cron-03h"), { timezone: "UTC" });
-cron.schedule("0 15 * * *", () => runAllScrapes("cron-12h"), { timezone: "UTC" });
-cron.schedule("0 1 * * *",  () => runAllScrapes("cron-22h"), { timezone: "UTC" });
-console.log("[CRON] scheduled 03h/12h/22h BRT = 06h/15h/01h UTC");
+// O agendamento agora é feito externamente via rota GET /api/cron/tick (ex: UptimeRobot a cada 5 min)
+console.log("[CRON] Usando arquitetura de Fila Assíncrona via /api/cron/tick");
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
