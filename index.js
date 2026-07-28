@@ -507,7 +507,7 @@ app.get("/api/cron/tick", async (req, res) => {
         SELECT 1 FROM scrape_history sh 
         WHERE sh.slug = p.slug 
           AND sh.slot = $1 
-          AND sh.created_at >= NOW() - INTERVAL '8 hours'
+          AND sh.collected_at >= NOW() - INTERVAL '8 hours'
       )
       LIMIT 5;
     `, [slot]);
