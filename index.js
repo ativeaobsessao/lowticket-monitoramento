@@ -599,7 +599,20 @@ app.get("/api/coletar/:slug", async (req, res) => {
 
 app.get("/api/coletar-tudo", async (_req, res) => {
   res.json({ status: "started" });
-  runAllScrapes("manual").catch((e) => console.error("[RUN] manual error:", e.message));
+  (async () => {
+    try {
+      const { rows: pages } = await query(`SELECT slug, nome, url FROM pages`);
+      if (pages.length === 0) {
+        console.log("[RUN] coleta-tudo: nenhuma página cadastrada");
+        return;
+      }
+      console.log(`[RUN] coleta-tudo manual iniciada — ${pages.length} páginas`);
+      await processBatch(pages, null);
+      console.log(`[RUN] coleta-tudo manual finalizada — ${pages.length} páginas`);
+    } catch (e) {
+      console.error("[RUN] manual error:", e.message);
+    }
+  })();
 });
 
 app.get("/api/historico/:slug", async (req, res) => {
