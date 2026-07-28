@@ -599,6 +599,13 @@ app.get("/api/coletar/:slug", async (req, res) => {
 
 app.get("/api/coletar-tudo", async (_req, res) => {
   res.json({ status: "started" });
+
+  if (isRunning) {
+    console.warn("[RUN] coleta-tudo abortada — já existe uma coleta em andamento (cron ou outro lote)");
+    return;
+  }
+  isRunning = true;
+
   (async () => {
     try {
       const { rows: pages } = await query(`SELECT slug, nome, url FROM pages`);
@@ -606,11 +613,23 @@ app.get("/api/coletar-tudo", async (_req, res) => {
         console.log("[RUN] coleta-tudo: nenhuma página cadastrada");
         return;
       }
-      console.log(`[RUN] coleta-tudo manual iniciada — ${pages.length} páginas`);
-      await processBatch(pages, null);
+
+      const CHUNK_SIZE = 5; // mesmo tamanho de lote usado pelo cron — navegador é reiniciado a cada lote
+      console.log(`[RUN] coleta-tudo manual iniciada — ${pages.length} páginas, em lotes de ${CHUNK_SIZE}`);
+
+      let processadas = 0;
+      for (let i = 0; i < pages.length; i += CHUNK_SIZE) {
+        const lote = pages.slice(i, i + CHUNK_SIZE);
+        await processBatch(lote, null);
+        processadas += lote.length;
+        console.log(`[RUN] coleta-tudo progresso: ${processadas}/${pages.length}`);
+      }
+
       console.log(`[RUN] coleta-tudo manual finalizada — ${pages.length} páginas`);
     } catch (e) {
       console.error("[RUN] manual error:", e.message);
+    } finally {
+      isRunning = false;
     }
   })();
 });
