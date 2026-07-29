@@ -343,15 +343,6 @@ async function runLote(itens) {
   }
 }
 
-function resolveSlot(trigger) {
-  switch (trigger) {
-    case "cron-03h": return 3;
-    case "cron-12h": return 12;
-    case "cron-22h": return 22;
-    default: return null;
-  }
-}
-
 async function mirrorToSheet(rows) {
   const url = process.env.SHEET_WEBHOOK_URL;
   if (!url) return;
@@ -430,9 +421,9 @@ function parseLoteInput(texto) {
 function getCurrentSlot() {
   const now = new Date();
   const hour = now.getUTCHours();
-  if (hour >= 1 && hour < 6) return "cron-22h";
-  if (hour >= 6 && hour < 15) return "cron-03h";
-  return "cron-12h";
+  if (hour >= 1 && hour < 6) return 22;
+  if (hour >= 6 && hour < 15) return 3;
+  return 12;
 }
 
 async function processBatch(pages, slot) {
