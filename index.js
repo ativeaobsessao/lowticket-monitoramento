@@ -44,6 +44,17 @@ async function query(sql, params = []) {
   }
 }
 
+// Garante que toda URL salva tenha esquema (http/https). Sem isso, o Playwright falha
+// ao tentar navegar ("Cannot navigate to invalid URL") e, em links renderizados no
+// front-end (<a href="...">), o navegador interpreta como caminho relativo e abre
+// dentro do próprio domínio do app (ex: "Cannot GET /dominio.com").
+function normalizeUrl(url) {
+  if (!url) return url;
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
 async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
@@ -468,19 +479,37 @@ async function processBatch(pages, slot) {
     for (let i = 0; i < pages.length; i++) {
       const p = pages[i];
 
+      // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
+      // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
       let count = null;
-      for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-        try {
-          count = await scrapeWithContext(context, p.url);
-        } catch (err) {
-          console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+      let falhaMotivo = null;
+      if (!/^https?:\/\//i.test(p.url || "")) {
+        falhaMotivo = `URL inválida (falta http/https): "${p.url}"`;
+        console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
+      } else {
+        for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
+          try {
+            count = await scrapeWithContext(context, p.url);
+          } catch (err) {
+            falhaMotivo = err.message;
+            console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+          }
         }
       }
-      const final = count ?? 0;
 
-      await saveCount(p.slug, final, slot);
-      results.push({ slug: p.slug, nome: p.nome, count: final });
-      
+      // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
+      // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
+      // da janela de 8h.
+      if (count === null) {
+        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta (${falhaMotivo || "motivo desconhecido"}) — pulado, histórico preservado (sem gravar 0 falso)`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
+
+      await saveCount(p.slug, count, slot);
+      results.push({ slug: p.slug, nome: p.nome, count });
+
       // Delay tático entre páginas
       await new Promise(r => setTimeout(r, 1500));
     }
@@ -490,8 +519,9 @@ async function processBatch(pages, slot) {
     if (browser) await browser.close();
   }
 
-  if (results.length > 0) {
-    await mirrorToSheet(results);
+  const resultsOk = results.filter((r) => r.count !== null);
+  if (resultsOk.length > 0) {
+    await mirrorToSheet(resultsOk);
   }
   return results;
 }
@@ -536,8 +566,9 @@ app.get("/api/cron/tick", async (req, res) => {
 });
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
-  if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
+  const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
+  if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
+  const url = normalizeUrl(urlRaw);
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
@@ -1795,10 +1826,12 @@ app.post("/admin/funis/remover-caminho", async (req, res) => {
 });
 
 app.post("/api/funis/salvar-node", async (req, res) => {
-  const { slug, tipo, rotulo, url, checkout_url } = req.body;
-  if (!slug || !tipo || !rotulo || !url) {
+  const { slug, tipo, rotulo, url: urlRaw, checkout_url: checkoutRaw } = req.body;
+  if (!slug || !tipo || !rotulo || !urlRaw) {
     return res.status(400).json({ error: "Missing required fields" });
   }
+  const url = normalizeUrl(urlRaw);
+  const checkout_url = checkoutRaw ? normalizeUrl(checkoutRaw) : checkoutRaw;
 
   try {
     // 1. Resolve ou cria o nó da Landing Page
