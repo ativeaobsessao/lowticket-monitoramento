@@ -1,6 +1,18 @@
 -- ============================================================================
--- SCHEMA PADRÃO DA EMPRESA — MONITORAMENTO DE META ADS & MAPEAMENTO DE FUNIS
+-- SCHEMA — MONITORAMENTO DE META ADS & MAPEAMENTO DE FUNIS (VIVA Labs / lowticket)
 -- Compatível com PostgreSQL / NEON / Render
+-- ============================================================================
+-- Snapshot do schema tal como é criado/mantido por initDb() em index.js.
+-- Reflete o estado ATUAL do código: 5 tabelas. Este sistema NÃO possui a
+-- tabela/coluna 'brand(s)' — diferente da instância DTC, aqui não há esse
+-- recurso implementado no index.js, então não deve ser criado aqui.
+--
+-- Este arquivo é referência/documentação e para provisionar um banco NOVO
+-- do zero. Em produção, quem efetivamente cria/migra as tabelas é o
+-- initDb() do index.js, rodando automaticamente a cada boot do processo —
+-- rodar este arquivo manualmente não é necessário no dia a dia.
+--
+-- Ordem de criação respeita as foreign keys: pages → funnel_nodes → funnel_edges
 -- ============================================================================
 
 SET search_path TO public;
@@ -28,7 +40,7 @@ CREATE TABLE IF NOT EXISTS scrape_history (
   id           SERIAL PRIMARY KEY,
   slug         TEXT NOT NULL,
   ads_count    INTEGER NOT NULL,
-  slot         SMALLINT,                        -- Slot do cron (ex: 3 para 03h, 12 para 12h, 22 para 22h) ou NULL se manual
+  slot         SMALLINT,                        -- Slot do cron (3=03h, 12=12h, 22=22h) ou NULL se manual
   collected_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -45,12 +57,14 @@ CREATE TABLE IF NOT EXISTS scrape_latest (
 );
 
 -- ----------------------------------------------------------------------------
--- 4. MAPEAMENTO DE FUNIS — NÓS (PÁGINAS/ETAPAS DO FUNIL)
+-- 4. MAPEAMENTO DE FUNIS — NÓS (ETAPAS DO FUNIL)
 -- ----------------------------------------------------------------------------
+-- CHECK ampliado (blueprint ADS/Presell): inclui 'ads' e 'presell' além dos
+-- tipos originais. Nós existentes não são afetados.
 CREATE TABLE IF NOT EXISTS funnel_nodes (
   id         SERIAL PRIMARY KEY,
   slug       TEXT NOT NULL REFERENCES pages(slug) ON DELETE CASCADE,
-  tipo       TEXT NOT NULL CHECK (tipo IN ('advertorial','tsl','vsl','quiz','whatsapp','checkout')),
+  tipo       TEXT NOT NULL CHECK (tipo IN ('ads','advertorial','presell','tsl','vsl','quiz','whatsapp','checkout')),
   rotulo     TEXT NOT NULL,
   url        TEXT NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -70,3 +84,9 @@ CREATE TABLE IF NOT EXISTS funnel_edges (
 
 CREATE INDEX IF NOT EXISTS idx_funnel_edges_from ON funnel_edges(from_node_id);
 CREATE INDEX IF NOT EXISTS idx_funnel_edges_to ON funnel_edges(to_node_id);
+
+-- ============================================================================
+-- Fim. 5 tabelas: pages, scrape_history, scrape_latest, funnel_nodes,
+-- funnel_edges. Conferido linha a linha contra os CREATE TABLE do initDb()
+-- em index.js — não há nenhuma outra tabela criada pela aplicação.
+-- ============================================================================
