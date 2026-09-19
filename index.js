@@ -99,6 +99,15 @@ async function initDb() {
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS funil TEXT`);
 
+  // FIX (fila travada / starvation do cron): coluna que registra a última tentativa
+  // de coleta de cada página, sucesso OU falha. Sem isso, uma página com falha
+  // persistente nunca sai da lista de "pendentes" do slot (porque falha não grava em
+  // scrape_history) e, sem ORDER BY, a query do /api/cron/tick devolvia sempre as
+  // mesmas 5 páginas quebradas em todo tick — monopolizando o LIMIT 5 e impedindo
+  // qualquer outra página do slot de ser tentada. Ver uso em processBatch() e na
+  // query de /api/cron/tick.
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP`);
+
   await query(`
     CREATE TABLE IF NOT EXISTS funnel_nodes (
       id         SERIAL PRIMARY KEY,
@@ -196,22 +205,30 @@ async function scrapeWithContext(context, url) {
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // CORREÇÃO: as URLs no formato /ads/library/?id=<ad_id> não abrem a busca
+    // CORREÇÃO v2: as URLs no formato /ads/library/?id=<ad_id> não abrem a busca
     // diretamente — a Meta devolve uma página "casca" que redireciona via JS pro
-    // endereço real (o <meta http-equiv="refresh"> só existe como fallback pra
-    // navegadores sem JS, dentro de um <noscript> — por isso ele aparecia como
-    // TEXTO literal no bodyText, e não como um redirecionamento de fato seguido).
-    // Em vez de confiar que o JS do redirect roda sozinho no nosso contexto
-    // automatizado dentro da janela de espera, detectamos e seguimos manualmente.
+    // endereço real. Esse redirecionamento é declarado num <meta http-equiv="refresh">
+    // que fica dentro de um <noscript> — e com JS habilitado (nosso caso), o navegador
+    // NUNCA materializa esse conteúdo como DOM real. Por isso a versão anterior, que
+    // procurava a tag via document.querySelector (page.evaluate), nunca encontrava
+    // nada e o redirect nunca era seguido de fato: a página ficava presa na casca até
+    // o timeout, e a extração falhava sempre com "preso numa página de
+    // redirecionamento (meta refresh) que não completou".
+    // Agora lemos o HTML BRUTO servido (page.content()), que inclui o conteúdo do
+    // <noscript> como texto puro, extraímos a URL de destino via regex e decodificamos
+    // as entidades HTML manualmente (&amp; etc.) antes de navegar — isso funciona
+    // independente de o JS materializar a tag no DOM ou não.
     for (let hop = 0; hop < 3; hop++) {
-      const refreshTarget = await page.evaluate(() => {
-        const meta = document.querySelector('meta[http-equiv="refresh" i]');
-        if (!meta) return null;
-        const m = (meta.getAttribute("content") || "").match(/url\s*=\s*(.+)$/i);
-        return m ? m[1].trim().replace(/^['"]|['"]$/g, "") : null;
-      }).catch(() => null);
-      if (!refreshTarget) break;
-      const nextUrl = new URL(refreshTarget, page.url()).toString();
+      const html = await page.content();
+      const m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url\s*=\s*([^"'>]+)["']/i);
+      if (!m) break;
+      const target = m[1].trim()
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">");
+      const nextUrl = new URL(target, page.url()).toString();
       await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     }
 
@@ -570,6 +587,13 @@ async function processBatch(pages, slot) {
         }
       }
 
+      // FIX (fila travada / starvation do cron): registra a tentativa (sucesso OU
+      // falha) em pages.last_attempt_at. A query de /api/cron/tick agora ordena por
+      // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
+      // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
+      // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
+      await query(`UPDATE pages SET last_attempt_at = NOW() WHERE slug = $1`, [p.slug]);
+
       // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
       // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
       // da janela de 8h.
@@ -611,6 +635,15 @@ app.get("/api/cron/tick", async (req, res) => {
   
   try {
     const slot = getCurrentSlot();
+    // FIX (fila travada / starvation): ORDER BY p.last_attempt_at ASC NULLS FIRST
+    // garante rotação justa entre as páginas pendentes do slot. Sem isso, como a
+    // query não tinha ordenação explícita, o Postgres devolvia consistentemente as
+    // mesmas linhas (praticamente a ordem física da tabela) — então páginas que
+    // falham sempre (ex: bloqueio da Meta numa URL específica) nunca saíam do topo
+    // do resultado e ocupavam o LIMIT 5 inteiro em TODO tick, travando a coleta de
+    // qualquer outra página pendente daquele slot. Agora, toda página tentada
+    // (sucesso ou falha) vai pro fim da fila, e páginas nunca tentadas (NULL) vêm
+    // primeiro.
     const { rows: pages } = await query(`
       SELECT p.slug, p.nome, p.url
       FROM pages p
@@ -620,6 +653,7 @@ app.get("/api/cron/tick", async (req, res) => {
           AND sh.slot = $1 
           AND sh.collected_at >= NOW() - INTERVAL '8 hours'
       )
+      ORDER BY p.last_attempt_at ASC NULLS FIRST
       LIMIT 5;
     `, [slot]);
 
