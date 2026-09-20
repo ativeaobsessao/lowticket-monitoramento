@@ -190,47 +190,141 @@ function getChromiumPath() {
 
 // ─── Scraper ─────────────────────────────────────────────────────────────────
 
-async function extractCount(page) {
-  const txt = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
-  let m = txt.match(/([\d.,]+)\s*(resultados|results)/i);
-  if (!m) m = (await page.content()).match(/([\d.,]+)\s*(resultados|results)/i);
-  if (!m) return null;
-  const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
-  return Number.isNaN(n) ? null : n;
+function getBrowserLaunchArgs() {
+  return [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--window-size=1366,768",
+  ];
 }
 
-async function waitForCounter(page, ms) {
-  await page.waitForFunction(
-    () => /[\d.,]+\s*(resultados|results)/i.test(document.body?.innerText || ""),
-    null,
-    { timeout: ms }
-  ).catch(() => {});
+async function createStealthContext(browser) {
+  const context = await browser.newContext({
+    locale: "pt-BR",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1366, height: 768 },
+    extraHTTPHeaders: {
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+    },
+  });
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["pt-BR", "pt", "en-US", "en"] });
+    window.chrome = { runtime: {} };
+  });
+
+  return context;
+}
+
+async function extractCount(page) {
+  return await page.evaluate(() => {
+    const bodyText = document.body ? document.body.innerText : "";
+    let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    if (m) {
+      const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    const elements = Array.from(document.querySelectorAll("div, span, h1, h2, h3, p, strong, b"));
+    for (const el of elements) {
+      const txt = el.innerText || "";
+      if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados|results)/i.test(txt)) {
+        const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+        if (match) {
+          const n = parseInt(match[1].replace(/[,.]/g, ""), 10);
+          if (!Number.isNaN(n)) return n;
+        }
+      }
+    }
+
+    const docText = document.documentElement ? document.documentElement.innerText : "";
+    m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    if (m) {
+      const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    return null;
+  }).catch(() => null);
+}
+
+async function waitForCounter(page, maxWaitMs = 18000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const count = await extractCount(page);
+    if (count !== null) return count;
+    await page.evaluate(() => window.scrollBy(0, 100)).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+  return null;
+}
+
+function cleanMetaUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.hostname.includes("facebook.com") && u.searchParams.has("view_all_page_id") && u.searchParams.has("id")) {
+      u.searchParams.delete("id");
+      return u.toString();
+    }
+  } catch {}
+  return rawUrl;
 }
 
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
   try {
+    // Bloqueia APENAS imagens e mídias pesadas — NUNCA bloqueia CSS nem scripts
     await page.route("**/*", (route) => {
       const type = route.request().resourceType();
-      if (["image", "media", "font", "stylesheet"].includes(type)) route.abort();
-      else route.continue();
+      if (["image", "media"].includes(type)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await waitForCounter(page, 15000);
-    let n = await extractCount(page);
+    const targetUrl = cleanMetaUrl(url);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+
+    let n = await waitForCounter(page, 18000);
     if (n !== null) return n;
 
-    // Só com o contador ausente: tenta UM meta-refresh
+    // Se o contador não apareceu e a URL foi limpa, tenta a original também
+    if (targetUrl !== url) {
+      console.log(`[SCRAPE] tentando URL alternativa: ${url}`);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+      n = await waitForCounter(page, 12000);
+      if (n !== null) return n;
+    }
+
+    // Se ainda não encontrou, checa se tem redirect para outra URL que NÃO SEJA _fb_noscript
     const html = await page.content();
     const m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url\s*=\s*([^"'>]+)["']/i);
-    if (m) {
+    if (m && !m[1].includes("_fb_noscript")) {
       const target = m[1].trim().replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-      await page.goto(new URL(target, page.url()).toString(), { waitUntil: "domcontentloaded", timeout: 30000 });
-      await waitForCounter(page, 15000);
-      n = await extractCount(page);
+      const nextUrl = new URL(target, page.url()).toString();
+      console.log(`[SCRAPE] seguindo redirect válido: ${nextUrl}`);
+      await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      n = await waitForCounter(page, 12000);
+      if (n !== null) return n;
     }
-    return n;
+
+    // Log de diagnóstico
+    const pageTitle = await page.title().catch(() => "");
+    const bodySnippet = await page.evaluate(() => {
+      return (document.body ? document.body.innerText.slice(0, 300) : "").replace(/\s+/g, " ").trim();
+    }).catch(() => "");
+    console.warn(`[SCRAPE-DIAG] Falha na extração. Title: "${pageTitle}" | Conteúdo visto: "${bodySnippet}"`);
+
+    return null;
   } finally {
     await page.close();
   }
@@ -241,14 +335,10 @@ async function scrapeAdCount(url, retries = 3) {
     const browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: getBrowserLaunchArgs(),
     });
     try {
-      const context = await browser.newContext({
-        locale: "pt-BR",
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-      });
+      const context = await createStealthContext(browser);
       const count = await scrapeWithContext(context, url);
       if (count !== null) {
         console.log(`[SCRAPE] attempt=${attempt} count=${count}`);
@@ -260,7 +350,7 @@ async function scrapeAdCount(url, retries = 3) {
     } finally {
       await browser.close();
     }
-    if (attempt < retries) await new Promise((r) => setTimeout(r, 5000));
+    if (attempt < retries) await new Promise((r) => setTimeout(r, 4000));
   }
   console.error(`[SCRAPE] all ${retries} attempts failed, returning null`);
   return null;
@@ -369,13 +459,9 @@ async function runLote(itens) {
     browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: getBrowserLaunchArgs(),
     });
-    const context = await browser.newContext({
-      locale: "pt-BR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-    });
+    const context = await createStealthContext(browser);
 
     for (const item of itens) {
       loteStatus.atual = item.nome;
@@ -508,13 +594,9 @@ async function processBatch(pages, slot) {
     browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: getBrowserLaunchArgs(),
     });
-    context = await browser.newContext({
-      locale: "pt-BR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-    });
+    context = await createStealthContext(browser);
   }
 
   try {
