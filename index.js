@@ -221,6 +221,34 @@ async function createStealthContext(browser) {
     window.chrome = { runtime: {} };
   });
 
+  // Injeta cookies de sessão do Facebook se configurados
+  const fbCookiesRaw = process.env.FB_COOKIES;
+  if (fbCookiesRaw) {
+    try {
+      const raw = JSON.parse(fbCookiesRaw);
+      // Suporta formato Cookie-Editor (array de objetos) e formato Netscape simplificado
+      const cookies = raw.map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain || ".facebook.com",
+        path: c.path || "/",
+        httpOnly: c.httpOnly ?? false,
+        secure: c.secure ?? true,
+        sameSite: c.sameSite === "no_restriction" ? "None"
+                : c.sameSite === "lax" ? "Lax"
+                : c.sameSite === "strict" ? "Strict"
+                : "None",
+        ...(c.expirationDate ? { expires: Math.floor(c.expirationDate) } : {}),
+      }));
+      await context.addCookies(cookies);
+      console.log(`[AUTH] ${cookies.length} cookies do Facebook injetados no contexto.`);
+    } catch (err) {
+      console.warn(`[AUTH] Falha ao parsear FB_COOKIES: ${err.message} — continuando sem autenticação.`);
+    }
+  } else {
+    console.warn("[AUTH] FB_COOKIES não definido — Playwright rodará sem sessão (pode falhar na Meta).");
+  }
+
   return context;
 }
 
