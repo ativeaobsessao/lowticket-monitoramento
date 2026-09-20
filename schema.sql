@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS pages (
   geo           TEXT,                           -- Região/País de atuação
   nicho         TEXT,                           -- Segmento/Nicho da marca
   funil         TEXT,                           -- Rótulo do funil associado
+  last_attempt_at TIMESTAMP,                    -- Timestamp da última checagem tentada
+  last_status   TEXT,                           -- 'ok' ou 'falha_scraping'
   created_at    TIMESTAMP NOT NULL DEFAULT NOW()
 );
 

@@ -107,6 +107,7 @@ async function initDb() {
   // qualquer outra página do slot de ser tentada. Ver uso em processBatch() e na
   // query de /api/cron/tick.
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_status TEXT`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS funnel_nodes (
@@ -189,100 +190,47 @@ function getChromiumPath() {
 
 // ─── Scraper ─────────────────────────────────────────────────────────────────
 
+async function extractCount(page) {
+  const txt = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
+  let m = txt.match(/([\d.,]+)\s*(resultados|results)/i);
+  if (!m) m = (await page.content()).match(/([\d.,]+)\s*(resultados|results)/i);
+  if (!m) return null;
+  const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
+  return Number.isNaN(n) ? null : n;
+}
+
+async function waitForCounter(page, ms) {
+  await page.waitForFunction(
+    () => /[\d.,]+\s*(resultados|results)/i.test(document.body?.innerText || ""),
+    null,
+    { timeout: ms }
+  ).catch(() => {});
+}
+
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
   try {
-    // PILAR 1: Interceptação de Rede (Network Blocking)
-    // Aborta o download de imagens, vídeos, css e fontes pesadas da Meta Ad Library para economizar 70% de RAM e CPU.
     await page.route("**/*", (route) => {
       const type = route.request().resourceType();
-      if (["image", "media", "font", "stylesheet"].includes(type)) {
-        route.abort();
-      } else {
-        route.continue();
-      }
+      if (["image", "media", "font", "stylesheet"].includes(type)) route.abort();
+      else route.continue();
     });
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await waitForCounter(page, 15000);
+    let n = await extractCount(page);
+    if (n !== null) return n;
 
-    // CORREÇÃO v2: as URLs no formato /ads/library/?id=<ad_id> não abrem a busca
-    // diretamente — a Meta devolve uma página "casca" que redireciona via JS pro
-    // endereço real. Esse redirecionamento é declarado num <meta http-equiv="refresh">
-    // que fica dentro de um <noscript> — e com JS habilitado (nosso caso), o navegador
-    // NUNCA materializa esse conteúdo como DOM real. Por isso a versão anterior, que
-    // procurava a tag via document.querySelector (page.evaluate), nunca encontrava
-    // nada e o redirect nunca era seguido de fato: a página ficava presa na casca até
-    // o timeout, e a extração falhava sempre com "preso numa página de
-    // redirecionamento (meta refresh) que não completou".
-    // Agora lemos o HTML BRUTO servido (page.content()), que inclui o conteúdo do
-    // <noscript> como texto puro, extraímos a URL de destino via regex e decodificamos
-    // as entidades HTML manualmente (&amp; etc.) antes de navegar — isso funciona
-    // independente de o JS materializar a tag no DOM ou não.
-    for (let hop = 0; hop < 3; hop++) {
-      const html = await page.content();
-      const m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url\s*=\s*([^"'>]+)["']/i);
-      if (!m) break;
-      const target = m[1].trim()
-        .replace(/&amp;/g, "&")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">");
-      const nextUrl = new URL(target, page.url()).toString();
-      await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    // Só com o contador ausente: tenta UM meta-refresh
+    const html = await page.content();
+    const m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url\s*=\s*([^"'>]+)["']/i);
+    if (m) {
+      const target = m[1].trim().replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+      await page.goto(new URL(target, page.url()).toString(), { waitUntil: "domcontentloaded", timeout: 30000 });
+      await waitForCounter(page, 15000);
+      n = await extractCount(page);
     }
-
-    await page.waitForTimeout(15000);
-    const content = await page.content();
-    const htmlMatch = content.match(/([\d.,]+)\s*(resultados|results)/i);
-    if (htmlMatch) {
-      const parsed = parseInt(htmlMatch[1].replace(/[,.]/g, ""), 10);
-      if (!isNaN(parsed)) return parsed;
-    }
-    for (const kw of ["resultados", "results"]) {
-      try {
-        const el = page.locator(`text=/${kw}/i`).first();
-        await el.waitFor({ timeout: 3000 });
-        const texto = await el.innerText();
-        const match = texto.replace(/[,.]/g, "").match(/\d+/);
-        if (match) return parseInt(match[0], 10);
-      } catch {
-        continue;
-      }
-    }
-    const bodyText = (await page.textContent("body")) ?? "";
-    const textMatch = bodyText.match(/([\d.,]+)\s*(resultados|results)/i);
-    if (textMatch) {
-      const parsed = parseInt(textMatch[1].replace(/[,.]/g, ""), 10);
-      if (!isNaN(parsed)) return parsed;
-    }
-
-    // DIAGNÓSTICO: antes disso retornava `null` sem motivo nenhum, e todo mundo
-    // virava "FALHA (motivo desconhecido)" no log — impossível saber se era bloqueio,
-    // captcha, cookie wall ou página vazia. Agora identificamos o sinal mais provável
-    // e jogamos isso pro log da próxima tentativa via exceção (falhaMotivo em processBatch).
-    const title = await page.title().catch(() => "");
-    const lower = bodyText.toLowerCase();
-    const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
-    let motivo = `texto "resultados/results" não encontrado — title="${title}"`;
-    // Checa isso ANTES do bloco genérico de palavras-chave — bodyText de uma SPA
-    // grande da Meta quase sempre contém "captcha"/"checkpoint"/"atividade incomum"
-    // em algum canto de boilerplate (rodapé, central de ajuda, textos ocultos),
-    // então casar essas palavras em QUALQUER lugar do texto dá falso positivo.
-    // Um <meta refresh> ainda presente como texto literal é sinal bem mais preciso:
-    // significa que ficamos presos numa página-casca de redirecionamento.
-    if (/http-equiv=["']refresh["']/i.test(bodyText)) {
-      motivo = `preso numa página de redirecionamento (meta refresh) que não completou mesmo após seguir manualmente — title="${title}"`;
-    } else if (lower.includes("checkpoint") || lower.includes("captcha") || lower.includes("unusual activity") || lower.includes("atividade incomum")) {
-      motivo = `possível checkpoint/captcha de segurança da Meta — title="${title}"`;
-    } else if (lower.includes("log in") || lower.includes("faça login") || lower.includes("entrar no facebook")) {
-      motivo = `possível bloqueio exigindo login — title="${title}"`;
-    } else if (lower.includes("cookie") && (lower.includes("aceit") || lower.includes("accept"))) {
-      motivo = `possível cookie/consent wall bloqueando o conteúdo — title="${title}"`;
-    } else if (bodyText.trim().length < 200) {
-      motivo = `página praticamente vazia (${bodyText.trim().length} chars) — possível bloqueio ou timeout de carregamento — title="${title}"`;
-    }
-    throw new Error(`${motivo} | snippet="${snippet}"`);
+    return n;
   } finally {
     await page.close();
   }
@@ -314,8 +262,8 @@ async function scrapeAdCount(url, retries = 3) {
     }
     if (attempt < retries) await new Promise((r) => setTimeout(r, 5000));
   }
-  console.error(`[SCRAPE] all ${retries} attempts failed, returning 0`);
-  return 0;
+  console.error(`[SCRAPE] all ${retries} attempts failed, returning null`);
+  return null;
 }
 
 // Dedupe considera slot — só bloqueia duplicata do MESMO slot
@@ -351,6 +299,10 @@ async function saveCount(slug, count, slot) {
 async function captureInicial(slug, url) {
   try {
     const count = await scrapeAdCount(url, 2);
+    if (count === null) {
+      console.warn(`[DESCOBERTA] slug=${slug} falhou, nada gravado`);
+      return null;
+    }
     await query(
       `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
       [slug, count]
@@ -381,7 +333,8 @@ async function captureInicialWithContext(context, slug, url) {
       console.error(`[LOTE] slug=${slug} attempt=${attempt} error: ${err.message}`);
     }
   }
-  const final = count ?? 0;
+  if (count === null) return null;
+  const final = count;
   await query(`UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`, [slug, final]);
   await query(
     `INSERT INTO scrape_latest (slug, ads_count, collected_at) VALUES ($1, $2, NOW())
@@ -477,6 +430,7 @@ async function mirrorToSheet(rows) {
 }
 
 let isRunning = false;
+let blockedUntil = 0;
 
 let loteStatus = {
   emAndamento: false,
@@ -592,7 +546,7 @@ async function processBatch(pages, slot) {
       // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
       // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
       // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
-      await query(`UPDATE pages SET last_attempt_at = NOW() WHERE slug = $1`, [p.slug]);
+      await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = $2 WHERE slug = $1`, [p.slug, count === null ? "falha_scraping" : "ok"]);
 
       // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
       // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
@@ -604,8 +558,26 @@ async function processBatch(pages, slot) {
         continue;
       }
 
-      await saveCount(p.slug, count, slot);
-      results.push({ slug: p.slug, nome: p.nome, count });
+      const final = count;
+
+      try {
+        if (slot !== null && slot !== undefined) {
+          await saveCount(p.slug, final, slot);
+        } else {
+          await query(
+            `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (slug) DO UPDATE
+               SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+            [p.slug, final]
+          );
+          console.log(`[LATEST] slug=${p.slug} count=${final} (manual)`);
+        }
+        results.push({ slug: p.slug, nome: p.nome, count: final });
+      } catch (dbErr) {
+        console.error(`[BATCH] slug=${p.slug} count=${final} COLETOU MAS FALHOU AO GRAVAR NO BANCO: ${dbErr.message}`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, dbError: true });
+      }
 
       // Delay tático entre páginas
       await new Promise(r => setTimeout(r, 1500));
@@ -631,6 +603,7 @@ app.get("/api/cron/tick", async (req, res) => {
   res.json({ status: "alive", message: "Tick received" });
   
   if (isRunning) return;
+  if (Date.now() < blockedUntil) return;
   isRunning = true;
   
   try {
@@ -663,7 +636,13 @@ app.get("/api/cron/tick", async (req, res) => {
     }
 
     console.log(`[TICK] Iniciando lote de ${pages.length} paginas para o slot ${slot}...`);
-    await processBatch(pages, slot);
+    const results = await processBatch(pages, slot);
+    const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
+    const metaRes = results.filter(r => metaSlugs.has(r.slug));
+    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError)) {
+      blockedUntil = Date.now() + 90 * 60 * 1000;
+      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
+    }
     console.log(`[TICK] Lote do slot ${slot} finalizado.`);
   } catch (err) {
     console.error("[TICK] Erro geral:", err);
@@ -727,6 +706,7 @@ app.get("/api/coletar/:slug", async (req, res) => {
   if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
   try {
     const count = await scrapeAdCount(row.url);
+    if (count === null) return res.status(502).type("text/plain").send("FALHA");
     res.type("text/plain").send(String(count));
     await query(
       `INSERT INTO scrape_latest (slug, ads_count, collected_at)
@@ -739,18 +719,16 @@ app.get("/api/coletar/:slug", async (req, res) => {
     console.log(`[LATEST] slug=${slug} count=${count} (manual via /api/coletar — histórico preservado)`);
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
-    res.type("text/plain").send("0");
+    res.status(500).type("text/plain").send("FALHA");
   }
 });
 
 app.get("/api/coletar-tudo", async (_req, res) => {
-  res.json({ status: "started" });
-
   if (isRunning) {
-    console.warn("[RUN] coleta-tudo abortada — já existe uma coleta em andamento (cron ou outro lote)");
-    return;
+    return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
   }
   isRunning = true;
+  res.json({ status: "started" });
 
   (async () => {
     try {
@@ -2132,7 +2110,7 @@ const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://ww
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -2169,6 +2147,8 @@ app.get("/dashboard", async (_req, res) => {
           ultimaColeta: latestRow
             ? new Date(latestRow.collected_at).toISOString()
             : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
+          tentativa:    p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null,
+          status:       p.last_status || null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
@@ -2648,6 +2628,7 @@ porAds.forEach((pag,idx)=>{
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
     +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
     +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
+    +(ultima[pag]?.status==='falha_scraping'&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · falhou</div>':'')
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
