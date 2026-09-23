@@ -341,7 +341,48 @@ function cleanMetaUrl(rawUrl) {
   return rawUrl;
 }
 
-async function scrapeWithContext(context, url) {
+// Preenche o objeto diag (quando recebido) com o status classificado da coleta.
+function setDiag(diag, status, detalhe) {
+  if (!diag) return;
+  diag.status = status;
+  diag.detalhe = detalhe ? String(detalhe).slice(0, 500) : null;
+}
+
+// Lê o estado atual da página: frase de vazio, título da Biblioteca, sinais de bloqueio e texto para diagnóstico.
+async function detectPageState(page) {
+  return await page.evaluate(() => {
+    const t = (document.body ? document.body.innerText : "").replace(/\s+/g, " ").trim();
+    return {
+      vazio: /Nenhum an[uú]ncio corresponde|No ads match/i.test(t),
+      biblioteca: /Biblioteca de An[uú]ncios|Ad Library/i.test(t),
+      bloqueio: /captcha|checkpoint|confirme que voc[eê] [ée] humano|confirm (that )?you.?re (a )?human|security check|verifica[cç][aã]o de seguran[cç]a/i.test(t) || /\/login|checkpoint/i.test(location.pathname),
+      texto: t.slice(0, 1500),
+    };
+  }).catch(() => null);
+}
+
+// Espera o contador OU a tela de vazio. O vazio só vale se a frase + título da Biblioteca
+// se mantiverem por 3s seguidos SEM nenhum contador aparecer (evita pegar estado transitório).
+async function waitForCounterOrEmpty(page, maxWaitMs = 18000) {
+  const start = Date.now();
+  let vazioDesde = null;
+  while (Date.now() - start < maxWaitMs) {
+    const count = await extractCount(page);
+    if (count !== null) return { count, vazio: false };
+    const st = await detectPageState(page);
+    if (st && st.vazio && st.biblioteca) {
+      if (vazioDesde === null) vazioDesde = Date.now();
+      else if (Date.now() - vazioDesde >= 3000) return { count: null, vazio: true };
+    } else {
+      vazioDesde = null;
+    }
+    await page.evaluate(() => window.scrollBy(0, 100)).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+  return { count: null, vazio: false };
+}
+
+async function scrapeWithContext(context, url, diag = null) {
   const page = await context.newPage();
   try {
     // Bloqueia APENAS imagens e mídias pesadas — NUNCA bloqueia CSS nem scripts
@@ -354,18 +395,35 @@ async function scrapeWithContext(context, url) {
       }
     });
 
-    const targetUrl = cleanMetaUrl(url);
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+    // Navegação com classificação: erro de rede/timeout vira falha_timeout e continua propagando o erro.
+    const irPara = async (alvo, timeout) => {
+      try {
+        await page.goto(alvo, { waitUntil: "domcontentloaded", timeout });
+      } catch (err) {
+        setDiag(diag, "falha_timeout", err.message);
+        throw err;
+      }
+    };
 
-    let n = await waitForCounter(page, 18000);
-    if (n !== null) return n;
+    // Resultado positivo: contador encontrado (ok) ou tela de vazio confirmada (ok_zero).
+    const concluir = (r) => {
+      if (r.count !== null) { setDiag(diag, "ok", null); return true; }
+      if (r.vazio) { setDiag(diag, "ok_zero", "Meta: Nenhum anúncio corresponde aos critérios de pesquisa"); return true; }
+      return false;
+    };
+
+    const targetUrl = cleanMetaUrl(url);
+    await irPara(targetUrl, 35000);
+
+    let r = await waitForCounterOrEmpty(page, 18000);
+    if (concluir(r)) return r.count ?? 0;
 
     // Se o contador não apareceu e a URL foi limpa, tenta a original também
     if (targetUrl !== url) {
       console.log(`[SCRAPE] tentando URL alternativa: ${url}`);
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
-      n = await waitForCounter(page, 12000);
-      if (n !== null) return n;
+      await irPara(url, 35000);
+      r = await waitForCounterOrEmpty(page, 12000);
+      if (concluir(r)) return r.count ?? 0;
     }
 
     // Se ainda não encontrou, checa se tem redirect para outra URL que NÃO SEJA _fb_noscript
@@ -375,17 +433,17 @@ async function scrapeWithContext(context, url) {
       const target = m[1].trim().replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
       const nextUrl = new URL(target, page.url()).toString();
       console.log(`[SCRAPE] seguindo redirect válido: ${nextUrl}`);
-      await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      n = await waitForCounter(page, 12000);
-      if (n !== null) return n;
+      await irPara(nextUrl, 30000);
+      r = await waitForCounterOrEmpty(page, 12000);
+      if (concluir(r)) return r.count ?? 0;
     }
 
-    // Log de diagnóstico
+    // Falha: classifica em bloqueio ou parse e registra 1500 caracteres do que o robô viu.
+    const estado = await detectPageState(page);
     const pageTitle = await page.title().catch(() => "");
-    const bodySnippet = await page.evaluate(() => {
-      return (document.body ? document.body.innerText.slice(0, 300) : "").replace(/\s+/g, " ").trim();
-    }).catch(() => "");
-    console.warn(`[SCRAPE-DIAG] Falha na extração. Title: "${pageTitle}" | Conteúdo visto: "${bodySnippet}"`);
+    const texto = estado ? estado.texto : "";
+    console.warn(`[SCRAPE-DIAG] Falha na extração. Title: "${pageTitle}" | Conteúdo visto: "${texto}"`);
+    setDiag(diag, estado && estado.bloqueio ? "falha_bloqueio" : "falha_parse", `Título: ${pageTitle} | ${texto}`);
 
     return null;
   } finally {
@@ -677,13 +735,15 @@ async function processBatch(pages, slot) {
       // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
       let count = null;
       let falhaMotivo = null;
+      let diag = { status: null, detalhe: null };
             if (!isMetaLibraryUrl(p.url || "")) {
         falhaMotivo = `URL inválida (não é da Biblioteca da Meta): "${p.url}"`;
+        diag = { status: "falha_url_invalida", detalhe: falhaMotivo };
         console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
       } else {
         for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
           try {
-            count = await scrapeWithContext(context, p.url);
+            count = await scrapeWithContext(context, p.url, diag);
           } catch (err) {
             falhaMotivo = err.message;
             console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
@@ -696,13 +756,21 @@ async function processBatch(pages, slot) {
       // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
       // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
       // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
-      await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = $2 WHERE slug = $1`, [p.slug, count === null ? "falha_scraping" : "ok"]);
+      // Status classificado: ok / ok_zero / falha_bloqueio / falha_timeout / falha_parse / falha_url_invalida
+      const statusFinal = count !== null
+        ? (diag.status === "ok_zero" ? "ok_zero" : "ok")
+        : (diag.status && diag.status.startsWith("falha_") ? diag.status : "falha_timeout");
+      const erroFinal = count !== null ? null : (String(diag.detalhe || falhaMotivo || "").slice(0, 500) || null);
+      await query(
+        `UPDATE pages SET last_attempt_at = NOW(), last_status = $2, last_error = $3 WHERE slug = $1`,
+        [p.slug, statusFinal, erroFinal]
+      );
 
       // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
       // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
       // da janela de 8h.
       if (count === null) {
-        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta (${falhaMotivo || "motivo desconhecido"}) — pulado, histórico preservado (sem gravar 0 falso)`);
+        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta [${statusFinal}] ${erroFinal || "sem detalhe"} — pulado, histórico preservado (sem gravar 0 falso)`);
         results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
         await new Promise(r => setTimeout(r, 1500));
         continue;
