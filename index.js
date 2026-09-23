@@ -827,6 +827,10 @@ app.get("/api/coletar/:slug", async (req, res) => {
       [slug, count]
     );
     console.log(`[LATEST] slug=${slug} count=${count} (manual via /api/coletar — histórico preservado)`);
+    
+    // FIX: coleta manual bem-sucedida também limpa o estado de falha em pages,
+    // senão o dashboard continua exibindo "tentou ... falhou" com o dado já atualizado.
+    await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok' WHERE slug = $1`, [slug]);
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
     res.status(500).type("text/plain").send("FALHA");
