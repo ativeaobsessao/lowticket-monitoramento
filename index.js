@@ -255,7 +255,7 @@ async function createStealthContext(browser) {
 async function extractCount(page) {
   return await page.evaluate(() => {
     const bodyText = document.body ? document.body.innerText : "";
-    let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
       if (!Number.isNaN(n)) return n;
@@ -264,8 +264,8 @@ async function extractCount(page) {
     const elements = Array.from(document.querySelectorAll("div, span, h1, h2, h3, p, strong, b"));
     for (const el of elements) {
       const txt = el.innerText || "";
-      if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados|results)/i.test(txt)) {
-        const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+      if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados?|results?)/i.test(txt)) {
+        const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
         if (match) {
           const n = parseInt(match[1].replace(/[,.]/g, ""), 10);
           if (!Number.isNaN(n)) return n;
@@ -274,7 +274,7 @@ async function extractCount(page) {
     }
 
     const docText = document.documentElement ? document.documentElement.innerText : "";
-    m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
       if (!Number.isNaN(n)) return n;
