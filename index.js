@@ -55,6 +55,40 @@ function normalizeUrl(url) {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
+// Valida se a URL é da Biblioteca de Anúncios da Meta (host facebook.com + caminho /ads/library).
+function isMetaLibraryUrl(url) {
+  try {
+    const u = new URL(url);
+    return /(^|\.)facebook\.com$/i.test(u.hostname) && u.pathname.startsWith("/ads/library");
+  } catch {
+    return false;
+  }
+}
+
+// Devolve uma URL válida da Biblioteca a partir do que foi enviado, ou null (rejeitar).
+// - Já é URL da Biblioteca: devolve como está (limpa aspas/espaços e garante https://).
+// - tipo "dominio" e veio só o domínio (ou URL do site): monta a busca por palavra-chave com country=ALL.
+// - Qualquer outro caso: null.
+function resolveMetaUrl(raw, tipo) {
+  if (!raw) return null;
+  const limpo = String(raw).trim().replace(/^["'\s]+|["'\s]+$/g, "");
+  if (!limpo) return null;
+  const comEsquema = normalizeUrl(limpo);
+  if (isMetaLibraryUrl(comEsquema)) return comEsquema;
+  if (tipo === "dominio") {
+    const dominio = limpo
+      .replace(/^https?:\/\//i, "")
+      .replace(/^www\./i, "")
+      .split(/[\/?#]/)[0]
+      .trim()
+      .toLowerCase();
+    if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(dominio)) {
+      return `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=${encodeURIComponent(dominio)}&search_type=keyword_unordered`;
+    }
+  }
+  return null;
+}
+
 async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
@@ -108,6 +142,7 @@ async function initDb() {
   // query de /api/cron/tick.
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_status TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_error TEXT`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS funnel_nodes (
@@ -597,9 +632,14 @@ function parseLoteInput(texto) {
       continue; // linha sem "|" ou vazia — ignora
     }
 
-    if (!nome || !url) continue;
+        if (!nome || !url) continue;
     const tipo = tipoForcado || (url.includes("view_all_page_id=") ? "pagina" : "dominio");
-    itens.push({ nome, url, tipo, instagram_url });
+    const urlValida = resolveMetaUrl(url, tipo);
+    if (!urlValida) {
+      console.warn(`[LOTE] linha ignorada, URL inválida para "${nome}": ${url}`);
+      continue;
+    }
+    itens.push({ nome, url: urlValida, tipo, instagram_url });
   }
   return itens;
 }
@@ -637,8 +677,8 @@ async function processBatch(pages, slot) {
       // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
       let count = null;
       let falhaMotivo = null;
-      if (!/^https?:\/\//i.test(p.url || "")) {
-        falhaMotivo = `URL inválida (falta http/https): "${p.url}"`;
+            if (!isMetaLibraryUrl(p.url || "")) {
+        falhaMotivo = `URL inválida (não é da Biblioteca da Meta): "${p.url}"`;
         console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
       } else {
         for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
@@ -764,10 +804,11 @@ app.get("/api/cron/tick", async (req, res) => {
 app.post("/api/salvar", async (req, res) => {
   const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
   if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
-  const url = normalizeUrl(urlRaw);
-  const slug = toSlug(nome);
+    const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const url = resolveMetaUrl(urlRaw, tipoFinal);
+  if (!url) return res.status(400).json({ error: "URL inválida: informe a URL da Meta Ad Library (facebook.com/ads/library) ou, para tipo dominio, apenas o domínio." });
   await query(
     `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -967,6 +1008,7 @@ app.get("/admin", async (_req, res) => {
     if (q.ok === "removido") return '<div class="msg ok">🗑️ Rastreamento removido.</div>';
     if (q.erro === "campos-obrigatorios") return '<div class="msg err">⚠️ Nome e URL são obrigatórios.</div>';
     if (q.erro === "nome-invalido") return '<div class="msg err">⚠️ Nome inválido.</div>';
+    if (q.erro === "url-invalida") return '<div class="msg err">⚠️ URL inválida. Use a URL da Meta Ad Library (facebook.com/ads/library) ou, para Domínio, apenas o domínio (ex: site.com).</div>';
     if (q.erro === "lote-vazio") return '<div class="msg err">⚠️ Nenhum item enviado no lote.</div>';
     if (q.erro === "lote-invalido") return '<div class="msg err">⚠️ Nenhuma linha válida encontrada no lote.</div>';
     if (q.erro === "lote-em-andamento") return '<div class="msg err">⚠️ Já existe um lote em andamento. Aguarde terminar.</div>';
@@ -1059,7 +1101,7 @@ ${msgOk}
       </div>
       <div class="field">
         <label>URL da Meta Ad Library</label>
-        <input type="url" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
+        <input type="text" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
       </div>
     </div>
 
@@ -1201,9 +1243,11 @@ function cancelarEdicao(){
 });
 
 app.post("/admin/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
-  if (!nome || !url) return res.redirect("/admin?erro=campos-obrigatorios");
+    const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
+  if (!nome || !urlRaw) return res.redirect("/admin?erro=campos-obrigatorios");
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const url = resolveMetaUrl(urlRaw, tipoFinal);
+  if (!url) return res.redirect("/admin?erro=url-invalida");
 
   // Modo edição: atualiza o registro existente pelo slug original — o slug NUNCA muda,
   // mesmo que o nome de exibição mude, para preservar o vínculo com scrape_history/scrape_latest.
