@@ -771,7 +771,7 @@ async function processBatch(pages, slot) {
       // da janela de 8h.
       if (count === null) {
         console.warn(`[BATCH] slug=${p.slug} FALHA na coleta [${statusFinal}] ${erroFinal || "sem detalhe"} — pulado, histórico preservado (sem gravar 0 falso)`);
-        results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
+        results.push({ slug: p.slug, nome: p.nome, count: null, status: statusFinal, falha: erroFinal || falhaMotivo || "falha desconhecida" });
         await new Promise(r => setTimeout(r, 1500));
         continue;
       }
@@ -857,9 +857,10 @@ app.get("/api/cron/tick", async (req, res) => {
     const results = await processBatch(pages, slot);
     const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
     const metaRes = results.filter(r => metaSlugs.has(r.slug));
-    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError)) {
+    const FALHAS_TECNICAS = ["falha_bloqueio", "falha_timeout", "falha_parse"];
+    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError && FALHAS_TECNICAS.includes(r.status))) {
       blockedUntil = Date.now() + 90 * 60 * 1000;
-      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
+      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam (${metaRes.map(r => r.status).join(", ")}) — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
     }
     console.log(`[TICK] Lote do slot ${slot} finalizado.`);
   } catch (err) {
@@ -939,7 +940,7 @@ app.get("/api/coletar/:slug", async (req, res) => {
     
     // FIX: coleta manual bem-sucedida também limpa o estado de falha em pages,
     // senão o dashboard continua exibindo "tentou ... falhou" com o dado já atualizado.
-    await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok' WHERE slug = $1`, [slug]);
+    await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok', last_error = NULL WHERE slug = $1`, [slug]);
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
     res.status(500).type("text/plain").send("FALHA");
@@ -2336,7 +2337,7 @@ const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://ww
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status, last_error FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -2375,6 +2376,7 @@ app.get("/dashboard", async (_req, res) => {
             : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
           tentativa:    p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null,
           status:       p.last_status || null,
+          erro:         p.last_error || null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
@@ -2854,7 +2856,7 @@ porAds.forEach((pag,idx)=>{
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
     +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
     +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
-    +(ultima[pag]?.status==='falha_scraping'&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · falhou</div>':'')
+    +(ultima[pag]?.status&&ultima[pag].status.indexOf('falha_')===0&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px" title="'+String(ultima[pag].erro||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').slice(0,300)+'">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · '+({falha_timeout:'timeout/rede',falha_bloqueio:'bloqueio da Meta',falha_parse:'contador não lido',falha_url_invalida:'URL inválida',falha_scraping:'falhou'}[ultima[pag].status]||'falhou')+'</div>':'')
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
