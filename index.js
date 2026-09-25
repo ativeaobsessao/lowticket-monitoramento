@@ -2531,7 +2531,11 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .rosca-wrap{display:flex;flex-direction:column;gap:16px;align-items:center;min-width:0}
 @media(min-width:900px){.rosca-wrap{flex-direction:row}}
 .rosca-canvas{width:clamp(120px,40vw,150px);height:clamp(120px,40vw,150px);position:relative;flex-shrink:0}
-.legend{display:flex;flex-direction:column;gap:7px;flex:1;min-width:0;max-height:260px;overflow-y:auto}
+.legend{display:flex;flex-direction:column;gap:7px;flex:1;min-width:0;max-height:260px;overflow-y:auto;padding-right:14px;scrollbar-gutter:stable}
+.legend::-webkit-scrollbar{width:6px}
+.legend::-webkit-scrollbar-track{background:transparent}
+.legend::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px}
+.legend::-webkit-scrollbar-thumb:hover{background:var(--muted)}
 .leg-item{display:flex;align-items:center;gap:9px}
 .leg-dot{width:10px;height:10px;border-radius:3px;flex-shrink:0}
 .leg-name{font-size:12px;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
