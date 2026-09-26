@@ -2139,35 +2139,70 @@ app.post("/admin/funis/remover-caminho", async (req, res) => {
   res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
 });
 
+// AUDITORIA (salvar-anúncio via botão "Ações" do card, extensão): antes, este endpoint
+// exigia SEMPRE um `rotulo` explícito no corpo da requisição (400 se ausente), porque os
+// únicos chamadores eram fluxos que já pediam o rótulo ao operador (o construtor de funil
+// multi-etapas). O novo botão "📢 Salvar Anúncio" do dropdown "Ações" de cada card salva em
+// 1 clique, sem abrir modal nenhum — não existe rótulo pra pedir. Regra nova: `rotulo`
+// continua obrigatório para todo `tipo`, EXCETO 'ads': quando `tipo === 'ads'` e nenhum
+// `rotulo` é enviado, o PRÓPRIO SERVIDOR gera "ads01", "ads02", "ads03"... contando quantos
+// nós `tipo='ads'` já existem para aquele `slug`. A geração fica no servidor (nunca no
+// content.js) de propósito: evita que dois cliques rápidos em anúncios diferentes gerem o
+// mesmo número por uma corrida no cliente — a contagem e o INSERT acontecem em sequência
+// dentro da mesma requisição no servidor.
+// Também: quando o node já existe (mesmo slug+url — ex: o operador clica "Salvar Anúncio"
+// duas vezes no mesmo card), só atualiza tipo/rótulo se um rótulo EXPLÍCITO foi enviado —
+// nunca renumera um "adsNN" que já foi salvo antes, e a resposta devolve o rótulo final
+// usado (`rotulo`) para o pop-up de confirmação da extensão poder exibi-lo.
 app.post("/api/funis/salvar-node", async (req, res) => {
-  const { slug, tipo, rotulo, url: urlRaw, checkout_url: checkoutRaw } = req.body;
-  if (!slug || !tipo || !rotulo || !urlRaw) {
+  const { slug, tipo, rotulo: rotuloRaw, url: urlRaw, checkout_url: checkoutRaw } = req.body;
+  if (!slug || !tipo || !urlRaw) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+  if (!rotuloRaw && tipo !== "ads") {
     return res.status(400).json({ error: "Missing required fields" });
   }
   const url = normalizeUrl(urlRaw);
   const checkout_url = checkoutRaw ? normalizeUrl(checkoutRaw) : checkoutRaw;
 
   try {
-    // 1. Resolve ou cria o nó da Landing Page
+    // 1. Resolve ou cria o nó da Landing Page (ou do Anúncio, quando tipo='ads')
     let landingNodeId;
+    let rotuloResolvido = rotuloRaw || null;
     const { rows: existingLanding } = await query(
-      "SELECT id FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
+      "SELECT id, rotulo FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
       [slug, url]
     );
 
     if (existingLanding.length > 0) {
       landingNodeId = existingLanding[0].id;
-      // Atualiza o tipo e rótulo caso tenham mudado
-      await query(
-        "UPDATE funnel_nodes SET tipo = $1, rotulo = $2 WHERE id = $3",
-        [tipo, rotulo, landingNodeId]
-      );
+      rotuloResolvido = existingLanding[0].rotulo;
+      // Só atualiza tipo/rótulo se um rótulo EXPLÍCITO veio na requisição — para um
+      // salvamento rápido de 'ads' sem rótulo (o caso normal do botão da extensão), o node
+      // já existente mantém o rótulo original, nunca é renumerado.
+      if (rotuloRaw) {
+        await query(
+          "UPDATE funnel_nodes SET tipo = $1, rotulo = $2 WHERE id = $3",
+          [tipo, rotuloRaw, landingNodeId]
+        );
+        rotuloResolvido = rotuloRaw;
+      }
     } else {
+      let rotuloFinal = rotuloRaw;
+      if (!rotuloFinal && tipo === "ads") {
+        const { rows: countRows } = await query(
+          "SELECT COUNT(*)::int AS n FROM funnel_nodes WHERE slug = $1 AND tipo = 'ads'",
+          [slug]
+        );
+        const proximoNumero = (countRows[0]?.n || 0) + 1;
+        rotuloFinal = `ads${String(proximoNumero).padStart(2, "0")}`;
+      }
       const { rows: newLanding } = await query(
         "INSERT INTO funnel_nodes (slug, tipo, rotulo, url) VALUES ($1, $2, $3, $4) RETURNING id",
-        [slug, tipo, rotulo, url]
+        [slug, tipo, rotuloFinal, url]
       );
       landingNodeId = newLanding[0].id;
+      rotuloResolvido = rotuloFinal;
     }
 
     // 2. Se houver checkout preenchido, resolve o nó do checkout e conecta
@@ -2205,7 +2240,7 @@ app.post("/api/funis/salvar-node", async (req, res) => {
       }
     }
 
-    res.json({ success: true, landingNodeId });
+    res.json({ success: true, landingNodeId, rotulo: rotuloResolvido });
   } catch (err) {
     console.error("[API] Error saving funnel node:", err.message);
     res.status(500).json({ error: "Internal server error" });
