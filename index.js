@@ -1037,7 +1037,7 @@ app.get("/admin", async (_req, res) => {
   }
 
   const lista = pages.map(p => `
-    <tr>
+    <tr data-search="${escAttr((p.nome + " " + p.url + " " + (p.geo||"") + " " + (p.nicho||"")).toLowerCase())}">
       <td><span class="badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐 Domínio" : "📡 Biblioteca"}</span></td>
       <td class="nome-cell">
         <div class="nome">${p.nome}</div>
@@ -1063,10 +1063,10 @@ app.get("/admin", async (_req, res) => {
           data-funil="${escAttr(p.funil)}"
           onclick="editarItem(this)">✏️ Editar</button>
         <a href="/admin/funis/${p.slug}" class="btn-funis">🔀 Funis</a>
-        <form method="POST" action="/admin/remover" style="display:inline" onsubmit="return confirm('Remover ${p.nome}?')">
+        <form id="form-remover-${escAttr(p.slug)}" method="POST" action="/admin/remover" style="display:none">
           <input type="hidden" name="slug" value="${p.slug}">
-          <button type="submit" class="btn-del">Remover</button>
         </form>
+        <button type="button" class="btn-del" data-slug="${escAttr(p.slug)}" data-nome="${escAttr(p.nome)}" onclick="abrirModalRemoverAdmin(this)">Remover</button>
       </td>
     </tr>`).join("");
 
@@ -1139,9 +1139,39 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 .msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px}
 .divider{border:none;border-top:1px solid var(--border);margin:16px 0}
+.search-wrap{position:relative;margin-bottom:16px}
+.search-wrap svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none}
+.search-wrap input{width:100%;padding:10px 14px 10px 38px;border-radius:10px;background:#0f0f1e;border:1px solid var(--border);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;outline:none;transition:.18s;box-sizing:border-box}
+.search-wrap input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,111,255,.15)}
+.search-wrap input::placeholder{color:var(--muted)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;z-index:9999;opacity:0;pointer-events:none;transition:opacity .2s ease}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal-card{background:#1c1c2e;border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:30px 28px 24px;max-width:360px;width:calc(100% - 40px);box-shadow:0 40px 100px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.06);transform:scale(.92) translateY(12px);transition:transform .28s cubic-bezier(.34,1.4,.64,1),opacity .22s ease;opacity:0;text-align:center}
+.modal-overlay.open .modal-card{transform:scale(1) translateY(0);opacity:1}
+.modal-icon{font-size:38px;margin-bottom:14px;line-height:1}
+.modal-title{font-size:16px;font-weight:700;color:#fff;margin-bottom:8px;letter-spacing:-.2px}
+.modal-desc{font-size:13px;color:#8888aa;margin-bottom:24px;line-height:1.6;word-break:break-word}
+.modal-desc b{color:#fb7185}
+.modal-actions{display:flex;gap:10px}
+.modal-btn-cancel{flex:1;background:rgba(255,255,255,.07);color:#e0e0f0;border:1px solid rgba(255,255,255,.1);border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;padding:12px 0;cursor:pointer;transition:background .15s}
+.modal-btn-cancel:hover{background:rgba(255,255,255,.13)}
+.modal-btn-confirm{flex:1;background:#fb7185;color:#fff;border:none;border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;padding:12px 0;cursor:pointer;transition:background .15s,transform .1s}
+.modal-btn-confirm:hover{background:#f43f5e}
+.modal-btn-confirm:active{transform:scale(.97)}
 </style>
 </head>
 <body>
+<div class="modal-overlay" id="modal-remover-admin" onclick="fecharModalRemoverOverlayAdmin(event)">
+  <div class="modal-card">
+    <div class="modal-icon">🗑️</div>
+    <h3 class="modal-title">Remover rastreamento</h3>
+    <p class="modal-desc" id="modal-remover-admin-desc"></p>
+    <div class="modal-actions">
+      <button class="modal-btn-cancel" onclick="fecharModalRemoverAdmin()">Cancelar</button>
+      <button class="modal-btn-confirm" onclick="confirmarRemoverAdminFinal()">Remover</button>
+    </div>
+  </div>
+</div>
 <div class="hdr">
   <h1>⚙️ Admin — Lowticket Monitor</h1>
   <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
@@ -1236,10 +1266,15 @@ ${msgOk}
 <div class="card">
   <h2>📋 Rastreamentos cadastrados (${pages.length})</h2>
   ${pages.length === 0 ? '<div class="empty">Nenhum rastreamento cadastrado ainda.</div>' : `
+  <div class="search-wrap">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+    <input type="text" id="buscaRastreios" placeholder="Buscar por nome, URL, geo ou nicho..." oninput="filtrarRastreios()">
+  </div>
   <table>
     <thead><tr><th>Tipo</th><th>Nome / Metadados</th><th>Link Meta</th><th>Cadastrado</th><th></th></tr></thead>
-    <tbody>${lista}</tbody>
-  </table>`}
+    <tbody id="tbody-rastreios">${lista}</tbody>
+  </table>
+  <div class="empty" id="busca-rastreios-vazio" style="display:none">Nenhum resultado encontrado.</div>`}
 </div>
 
 <script>
@@ -1278,6 +1313,40 @@ function cancelarEdicao(){
   document.getElementById('submitBtn').textContent='Cadastrar';
   document.getElementById('cancelBtn').style.display='none';
   atualizarDica();
+}
+  
+function filtrarRastreios(){
+  const termo=document.getElementById('buscaRastreios').value.trim().toLowerCase();
+  const linhas=document.querySelectorAll('#tbody-rastreios tr');
+  let visiveis=0;
+  linhas.forEach(function(tr){
+    const match=!termo||(tr.dataset.search||'').includes(termo);
+    tr.style.display=match?'':'none';
+    if(match)visiveis++;
+  });
+  document.getElementById('busca-rastreios-vazio').style.display=visiveis===0?'block':'none';
+}
+
+var _slugParaRemoverAdmin=null;
+function abrirModalRemoverAdmin(btn){
+  _slugParaRemoverAdmin=btn.dataset.slug;
+  document.getElementById('modal-remover-admin-desc').innerHTML=
+    'Tem certeza que deseja remover <b>'+btn.dataset.nome+'</b>? Todo o histórico de coletas e dados desta biblioteca serão perdidos permanentemente.';
+  document.getElementById('modal-remover-admin').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function fecharModalRemoverAdmin(){
+  document.getElementById('modal-remover-admin').classList.remove('open');
+  document.body.style.overflow='';
+  _slugParaRemoverAdmin=null;
+}
+function fecharModalRemoverOverlayAdmin(e){
+  if(e.target===document.getElementById('modal-remover-admin'))fecharModalRemoverAdmin();
+}
+function confirmarRemoverAdminFinal(){
+  if(!_slugParaRemoverAdmin)return;
+  const frm=document.getElementById('form-remover-'+_slugParaRemoverAdmin);
+  if(frm)frm.submit();
 }
 
 (function iniciarPollingLote(){
@@ -2645,6 +2714,11 @@ tbody tr:hover td{background:var(--surface2)}
   .scalebar-bg{width:50px}
 }
 @media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
+.search-wrap{position:relative;margin-bottom:14px}
+.search-wrap svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none}
+.search-wrap input{width:100%;padding:10px 14px 10px 38px;border-radius:10px;background:var(--surface);border:1px solid var(--border);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;outline:none;transition:.18s;box-sizing:border-box}
+.search-wrap input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,111,255,.15)}
+.search-wrap input::placeholder{color:var(--muted)}
 </style>
 </head>
 <body>
@@ -2684,6 +2758,10 @@ tbody tr:hover td{background:var(--surface2)}
 </div>
 
 <div class="section-label">📋 Resumo completo</div>
+<div class="search-wrap">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+  <input type="text" id="pag_busca" placeholder="Buscar por nome, URL, geo ou nicho..." oninput="filtrarTabela('pag_')">
+</div>
 <div class="tbl-panel">
   <table>
     <thead><tr>
@@ -2692,6 +2770,7 @@ tbody tr:hover td{background:var(--surface2)}
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
   </table>
+  <div class="empty-hint" id="pag_busca-vazio" style="display:none;margin:0;border:none;border-top:1px solid var(--border);border-radius:0">Nenhum resultado encontrado.</div>
 </div>
 
 <div style="height:36px"></div>
@@ -2717,6 +2796,10 @@ tbody tr:hover td{background:var(--surface2)}
 </div>
 
 <div class="section-label">📋 Resumo completo</div>
+<div class="search-wrap">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+  <input type="text" id="dom_busca" placeholder="Buscar por nome, URL, geo ou nicho..." oninput="filtrarTabela('dom_')">
+</div>
 <div class="tbl-panel">
   <table>
     <thead><tr>
@@ -2725,6 +2808,7 @@ tbody tr:hover td{background:var(--surface2)}
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
   </table>
+  <div class="empty-hint" id="dom_busca-vazio" style="display:none;margin:0;border:none;border-top:1px solid var(--border);border-radius:0">Nenhum resultado encontrado.</div>
 </div>
 
 <div style="height:36px"></div>
@@ -2888,6 +2972,7 @@ porAds.forEach((pag,idx)=>{
     :'<span class="ig-none">—</span>';
 
   const tr=document.createElement("tr");
+  tr.dataset.search=(pag+" "+(ultima[pag]?.url||"")+" "+(m.geo||"")+" "+(m.nicho||"")).toLowerCase();
   tr.innerHTML=
     '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
     +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
@@ -2985,6 +3070,19 @@ if(!HD.dates.length||!HD.libs.length){
   const metaEl=document.getElementById(P+"acc-meta");
   if(metaEl)metaEl.textContent='('+rowCount+' registros)';
 }
+}
+
+function filtrarTabela(P){
+  const termo=document.getElementById(P+"busca").value.trim().toLowerCase();
+  const linhas=document.querySelectorAll("#"+P+"tbody tr");
+  let visiveis=0;
+  linhas.forEach(function(tr){
+    const match=!termo||(tr.dataset.search||"").includes(termo);
+    tr.style.display=match?"":"none";
+    if(match)visiveis++;
+  });
+  const msg=document.getElementById(P+"busca-vazio");
+  if(msg)msg.style.display=visiveis===0?"block":"none";
 }
 
 const D_DOM=__DADOS_DOM__;
