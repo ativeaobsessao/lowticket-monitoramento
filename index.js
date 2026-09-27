@@ -2647,6 +2647,16 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .leg-pct{font-size:11px;color:var(--muted);font-family:'Space Mono',monospace;width:32px;text-align:right}
 .chart-box{height:240px;position:relative}
 .hist-box{height:300px;position:relative}
+.hist-selection{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:24px;margin:-6px 0 10px;color:var(--muted);font-size:11px}
+.hist-selection[hidden]{display:none}
+.hist-reset{border:0;background:transparent;color:var(--accent);font:inherit;cursor:pointer;padding:4px 0;white-space:nowrap}
+.hist-reset:hover{text-decoration:underline}
+.hist-reset:focus-visible,.hist-pin-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.hist-pin-cell{min-width:78px}
+.hist-pin-btn{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--muted);font:600 11px 'Space Grotesk',sans-serif;padding:5px 8px;cursor:pointer;white-space:nowrap}
+.hist-pin-btn:hover{border-color:var(--accent);color:var(--text)}
+.hist-pin-btn.is-pinned,.hist-pin-btn.is-focused{border-color:var(--accent);background:rgba(124,111,255,.12);color:var(--accent)}
+.hist-pin-btn:disabled{cursor:not-allowed;opacity:.5}
 .tbl-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{background:var(--surface2);color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:11px 16px;text-align:left;font-weight:600}
@@ -2753,6 +2763,7 @@ tbody tr:hover td{background:var(--surface2)}
   </div>
   <div class="panel">
     <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+    <div class="hist-selection" id="pag_hist-selection" hidden><span id="pag_hist-status" aria-live="polite"></span><button class="hist-reset" id="pag_hist-reset" type="button">Restaurar padrão</button></div>
     <div class="hist-box"><canvas id="pag_cHist"></canvas></div>
   </div>
 </div>
@@ -2765,7 +2776,7 @@ tbody tr:hover td{background:var(--surface2)}
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Bibliotecas</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>#</th><th>Bibliotecas</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
       <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
@@ -2791,6 +2802,7 @@ tbody tr:hover td{background:var(--surface2)}
   </div>
   <div class="panel">
     <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+    <div class="hist-selection" id="dom_hist-selection" hidden><span id="dom_hist-status" aria-live="polite"></span><button class="hist-reset" id="dom_hist-reset" type="button">Restaurar padrão</button></div>
     <div class="hist-box"><canvas id="dom_cHist"></canvas></div>
   </div>
 </div>
@@ -2803,7 +2815,7 @@ tbody tr:hover td{background:var(--surface2)}
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>#</th><th>Domínios</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
       <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
@@ -2897,6 +2909,138 @@ function info(pag){
 
 const porAds=[...LP].sort((a,b)=>(ultima[b]?.ads||0)-(ultima[a]?.ads||0));
 const maxAds=ultima[porAds[0]]?.ads||1;
+const MAX_PINNED=4;
+const storageKey="viva_dashboard_pinned_"+P.replace(/_$/g,"");
+const chartSeries=porAds.slice(0,8);
+const pinButtons=new Map();
+let histChart=null;
+let storageUnavailable=false;
+
+function corBiblioteca(nome){
+  let hash=2166136261;
+  for(let i=0;i<nome.length;i++){
+    hash^=nome.charCodeAt(i);
+    hash=Math.imul(hash,16777619);
+  }
+  return COR[(hash>>>0)%COR.length];
+}
+
+function salvarPinned(){
+  try{
+    localStorage.setItem(storageKey,JSON.stringify(pinned));
+    storageUnavailable=false;
+  }catch(e){storageUnavailable=true}
+}
+
+function carregarPinned(){
+  let raw;
+  try{
+    raw=localStorage.getItem(storageKey);
+  }catch(e){storageUnavailable=true;return []}
+  let stored;
+  try{stored=JSON.parse(raw||"[]")}catch(e){
+    try{localStorage.removeItem(storageKey)}catch(error){storageUnavailable=true}
+    return [];
+  }
+  if(!Array.isArray(stored)){
+    try{localStorage.removeItem(storageKey)}catch(e){storageUnavailable=true}
+    return [];
+  }
+  const clean=Array.from(new Set(stored.filter(nome=>typeof nome==="string"&&LP.includes(nome)&&!chartSeries.includes(nome)))).slice(0,MAX_PINNED);
+  if(JSON.stringify(clean)!==JSON.stringify(stored)){
+    try{localStorage.setItem(storageKey,JSON.stringify(clean));}catch(e){storageUnavailable=true}
+  }
+  return clean;
+}
+
+let pinned=carregarPinned();
+let focoHist=pinned[pinned.length-1]||null;
+
+function bibliotecasHistorico(){
+  return Array.from(new Set([...chartSeries,...pinned]));
+}
+
+function atualizarBotoesFixacao(){
+  pinButtons.forEach((button,nome)=>{
+    const isPinned=pinned.includes(nome);
+    const isAutomatic=chartSeries.includes(nome);
+    const isFocused=focoHist===nome;
+    button.textContent="📌 "+(isPinned?"Fixada":isAutomatic?(isFocused?"Em destaque":"Destacar"):"Fixar");
+    button.classList.toggle("is-pinned",isPinned);
+    button.classList.toggle("is-focused",!isPinned&&isFocused);
+    button.disabled=!isPinned&&!isAutomatic&&pinned.length>=MAX_PINNED;
+    button.title=isPinned?"Desafixar do gráfico histórico":isAutomatic?(isFocused?"Remover destaque":"Destacar no gráfico histórico"):button.disabled?"Limite de 4 fixações. Desafixe uma biblioteca primeiro.":"Fixar e destacar no gráfico histórico";
+    button.setAttribute("aria-label",isPinned?"Desafixar "+nome+" do gráfico histórico":isAutomatic?(isFocused?"Remover destaque de "+nome:"Destacar "+nome+" no gráfico histórico"):("Fixar "+nome+" no gráfico histórico"));
+    button.setAttribute("aria-pressed",String(isPinned||isFocused));
+  });
+}
+
+function atualizarSelecaoHistorico(){
+  const selection=document.getElementById(P+"hist-selection");
+  const status=document.getElementById(P+"hist-status");
+  if(selection&&status){
+    selection.hidden=pinned.length===0&&focoHist===null&&!storageUnavailable;
+    const selectionStatus=pinned.length>0?pinned.length+(pinned.length===1?" biblioteca fixada":" bibliotecas fixadas")+" · "+bibliotecasHistorico().length+" séries no gráfico":focoHist?"Destacando: "+focoHist+" · "+bibliotecasHistorico().length+" séries no gráfico":"";
+    status.textContent=selectionStatus+(storageUnavailable?(selectionStatus?" · ":"")+"Não será mantido após recarregar":"");
+  }
+  atualizarBotoesFixacao();
+}
+
+function criarDatasetsHistorico(){
+  return bibliotecasHistorico().map(pag=>{
+    const didK=primeira[pag]||null;
+    const cor=corBiblioteca(pag);
+    const isFocused=focoHist===pag;
+    const isDimmed=focoHist!==null&&!isFocused;
+    return{
+      label:pag,
+      data:serie(pag),
+      borderColor:isDimmed?cor+"66":cor,
+      backgroundColor:"transparent",
+      borderWidth:isFocused?3:isDimmed?1.25:2,
+      pointBackgroundColor:datas.map(dk=>dk===didK?"#fb7185":isDimmed?cor+"66":cor),
+      pointRadius:datas.map(dk=>dk===didK?5:isFocused?3:2),
+      pointHoverRadius:6,
+      tension:.35,
+      spanGaps:true
+    };
+  });
+}
+
+function atualizarGraficoHistorico(){
+  if(!histChart)return;
+  const visibilidade=new Map(histChart.data.datasets.map((dataset,index)=>[dataset.label,histChart.isDatasetVisible(index)]));
+  histChart.data.datasets=criarDatasetsHistorico();
+  histChart.data.datasets.forEach((dataset,index)=>{
+    histChart.setDatasetVisibility(index,visibilidade.has(dataset.label)?visibilidade.get(dataset.label):true);
+  });
+  histChart.update("none");
+}
+
+function alternarFixacao(nome){
+  if(pinned.includes(nome)){
+    pinned=pinned.filter(item=>item!==nome);
+    if(focoHist===nome)focoHist=pinned[pinned.length-1]||null;
+  }else if(chartSeries.includes(nome)){
+    focoHist=focoHist===nome?null:nome;
+  }else{
+    if(pinned.length>=MAX_PINNED)return;
+    pinned=[...pinned,nome];
+    focoHist=nome;
+  }
+  salvarPinned();
+  atualizarSelecaoHistorico();
+  atualizarGraficoHistorico();
+}
+
+const resetHist=document.getElementById(P+"hist-reset");
+if(resetHist)resetHist.addEventListener("click",function(){
+  pinned=[];
+  focoHist=null;
+  salvarPinned();
+  atualizarSelecaoHistorico();
+  atualizarGraficoHistorico();
+});
 
 const escalando=LP.map(p=>({p,...info(p)}))
   .filter(x=>x.at>0&&(x.label==="Escalando forte"||x.label==="Crescendo"||x.label==="Subindo")&&x.pct>0)
@@ -2956,7 +3100,7 @@ porAds.forEach((pag,idx)=>{
   const last3=s.slice(-3);
   const spark3=last3.length>=2?(last3[last3.length-1]>last3[0]?'<span style="color:#34d399">▲ sub</span>':last3[last3.length-1]<last3[0]?'<span style="color:#fb7185">▼ cai</span>':'<span style="color:#888">= est</span>'):"—";
   const partPct=Math.round((x.at/maxAds)*100);
-  const corLib=COR[idx%COR.length];
+  const corLib=corBiblioteca(pag);
 
   // Monta célula do nome com badges de geo e nicho
   const m=meta?.[pag]||{};
@@ -2976,6 +3120,7 @@ porAds.forEach((pag,idx)=>{
   tr.innerHTML=
     '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
     +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
+    +'<td class="hist-pin-cell" data-label="Gráfico"></td>'
     +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
     +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
@@ -2988,8 +3133,15 @@ porAds.forEach((pag,idx)=>{
     +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
     +'<td class="spark3" data-label="3 dias">'+spark3+'</td>'
     +'<td class="ig-cell" data-label="Instagram">'+igCell+'</td>';
+  const pinButton=document.createElement("button");
+  pinButton.type="button";
+  pinButton.className="hist-pin-btn";
+  pinButton.addEventListener("click",function(){alternarFixacao(pag)});
+  pinButtons.set(pag,pinButton);
+  tr.querySelector(".hist-pin-cell").appendChild(pinButton);
   tbody.appendChild(tr);
 });
+atualizarBotoesFixacao();
 
 const ro=porAds.filter(p=>(ultima[p]?.ads||0)>0);
 const totalRo=ro.reduce((s,p)=>s+(ultima[p]?.ads||0),0);
@@ -2998,7 +3150,7 @@ ro.forEach((p,i)=>{
   const at=ultima[p]?.ads||0;
   const pct=totalRo>0?Math.round((at/totalRo)*100):0;
   const it=document.createElement("div");it.className="leg-item";
-  it.innerHTML='<span class="leg-dot" style="background:'+COR[porAds.indexOf(p)%COR.length]+'"></span>'
+  it.innerHTML='<span class="leg-dot" style="background:'+corBiblioteca(p)+'"></span>'
     +'<span class="leg-name" title="'+p+'">'+p+'</span>'
     +'<span class="leg-val">'+at.toLocaleString("pt-BR")+'</span>'
     +'<span class="leg-pct">'+pct+'%</span>';
@@ -3007,16 +3159,16 @@ ro.forEach((p,i)=>{
 
 new Chart(document.getElementById(P+"cRosca"),{
   type:"doughnut",
-  data:{labels:ro,datasets:[{data:ro.map(p=>ultima[p]?.ads||0),backgroundColor:ro.map(p=>COR[porAds.indexOf(p)%COR.length]),borderWidth:2,borderColor:"#12121f"}]},
+  data:{labels:ro,datasets:[{data:ro.map(p=>ultima[p]?.ads||0),backgroundColor:ro.map(corBiblioteca),borderWidth:2,borderColor:"#12121f"}]},
   options:{responsive:true,maintainAspectRatio:false,cutout:"62%",plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>" "+ctx.label+": "+ctx.parsed.toLocaleString("pt-BR")+" ads"}}}}
 });
 
-const LP_hist=porAds.slice(0,8);
-new Chart(document.getElementById(P+"cHist"),{
+histChart=new Chart(document.getElementById(P+"cHist"),{
   type:"line",
-  data:{labels:datas.map(fd),datasets:LP_hist.map((p)=>{const didK=primeira[p]||null;const c=COR[porAds.indexOf(p)%COR.length];return{label:p,data:serie(p),borderColor:c,backgroundColor:"transparent",borderWidth:2,pointBackgroundColor:datas.map(dk=>dk===didK?"#fb7185":c),pointRadius:datas.map(dk=>dk===didK?5:2),pointHoverRadius:6,tension:.35,spanGaps:true};})},
+  data:{labels:datas.map(fd),datasets:criarDatasetsHistorico()},
   options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"bottom",labels:{color:"#b8b8d0",font:{size:11,family:"Space Grotesk"},padding:10,boxWidth:8,usePointStyle:true}},tooltip:{callbacks:{label:ctx=>" "+ctx.dataset.label+": "+(ctx.parsed.y??"—")+" ads"}}},scales:{x:{ticks:{color:"#7a7a98",font:{size:11}},grid:{color:"#1c1c30"}},y:{ticks:{color:"#7a7a98",font:{size:11}},grid:{color:"#1c1c30"},beginAtZero:false}}}
 });
+atualizarSelecaoHistorico();
 
 escalando.forEach((x,i)=>{
   const el=document.getElementById(P+"spark"+i);
