@@ -289,7 +289,8 @@ async function createStealthContext(browser) {
 
 async function extractCount(page) {
   return await page.evaluate(() => {
-    const bodyText = document.body ? document.body.innerText : "";
+    const normalizeText = (text) => text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
+    const bodyText = normalizeText(document.body ? document.body.innerText : "");
     let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
@@ -298,7 +299,7 @@ async function extractCount(page) {
 
     const elements = Array.from(document.querySelectorAll("div, span, h1, h2, h3, p, strong, b"));
     for (const el of elements) {
-      const txt = el.innerText || "";
+      const txt = normalizeText(el.innerText || "");
       if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados?|results?)/i.test(txt)) {
         const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
         if (match) {
@@ -308,7 +309,7 @@ async function extractCount(page) {
       }
     }
 
-    const docText = document.documentElement ? document.documentElement.innerText : "";
+    const docText = normalizeText(document.documentElement ? document.documentElement.innerText : "");
     m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
       const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
