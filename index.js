@@ -2860,7 +2860,7 @@ ${adsPaginas.length === 0
 </div>
 
 <script>
-const IG_SVG=`${IG_SVG_ESC}`;
+const IG_SVG=\`${IG_SVG_ESC}\`;
 
 // ── Persistência client-side de séries fixadas no gráfico de Evolução Histórica ──
 // Escopo por grupo (pag_/dom_), independente do Top 8 automático por volume.
