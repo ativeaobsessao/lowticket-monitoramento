@@ -289,7 +289,7 @@ async function createStealthContext(browser) {
 
 async function extractCount(page) {
   return await page.evaluate(() => {
-    const normalizeText = (text) => text.replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
+    const normalizeText = (text) => text.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ");
     const bodyText = normalizeText(document.body ? document.body.innerText : "");
     let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados?|results?)/i);
     if (m) {
