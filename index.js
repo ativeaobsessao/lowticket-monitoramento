@@ -2,12 +2,13 @@ import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
 import { execSync } from "child_process";
+import { createHash } from "node:crypto";
 import pg from "pg";
 
 const { Pool } = pg;
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "256kb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Database ────────────────────────────────────────────────────────────────
@@ -652,6 +653,7 @@ let loteStatus = {
 
 let manualCheckStatus = {
   runId: null,
+  requestId: null,
   status: "idle",
   total: 0,
   concluidos: 0,
@@ -663,6 +665,8 @@ let manualCheckStatus = {
   finalizadoEm: null,
   erro: null,
 };
+const manualCheckRequestLedger = new Map();
+const MANUAL_CHECK_REQUEST_LEDGER_LIMIT = 500;
 
 // Parser de lote — aceita 3 formatos:
 //   Nome | URL
@@ -822,7 +826,7 @@ async function processBatch(pages, slot, onResult = null, onPageStart = null) {
         } catch (statusErr) {
           console.error(`[BATCH] slug=${p.slug} também falhou ao atualizar status: ${statusErr.message}`);
         }
-        const result = { slug: p.slug, nome: p.nome, count: null, status: "falha_gravacao", falha: dbErr.message, dbError: true };
+        const result = { slug: p.slug, nome: p.nome, count: null, status: "falha_gravacao", falha: "Não foi possível salvar a contagem no banco de dados.", dbError: true };
         results.push(result);
         if (onResult) onResult(result);
       }
@@ -981,6 +985,25 @@ app.get("/api/coletar/:slug", async (req, res) => {
   }
 });
 
+function manualCheckFailureMessage(status) {
+  const messages = {
+    falha_bloqueio: "A Meta não permitiu acessar a biblioteca durante a checagem.",
+    falha_timeout: "A página não respondeu dentro do tempo limite. Tente novamente.",
+    falha_parse: "Não foi possível identificar a contagem de anúncios.",
+    falha_url_invalida: "A URL cadastrada não é uma biblioteca válida.",
+    falha_gravacao: "A coleta foi feita, mas não foi possível salvar o resultado.",
+    falha_execucao: "A execução foi interrompida antes de concluir a coleta.",
+  };
+  return messages[status] || "Não foi possível concluir a coleta. Tente novamente.";
+}
+
+function fingerprintManualPages(pages) {
+  const canonical = pages
+    .map(({ slug, nome, url }) => [slug, nome, url])
+    .sort(([leftSlug], [rightSlug]) => leftSlug < rightSlug ? -1 : leftSlug > rightSlug ? 1 : 0);
+  return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+}
+
 function addManualCheckResult(result) {
   const sucesso = result.count !== null && !result.dbError;
   manualCheckStatus.resultados.push({
@@ -988,6 +1011,7 @@ function addManualCheckResult(result) {
     nome: result.nome,
     count: sucesso ? result.count : null,
     status: result.status || (sucesso ? "ok" : "falha_execucao"),
+    falha: sucesso ? null : manualCheckFailureMessage(result.status),
   });
   manualCheckStatus = {
     ...manualCheckStatus,
@@ -999,12 +1023,18 @@ function addManualCheckResult(result) {
 }
 
 async function startManualCheck(req, res) {
-  if (isRunning) {
-    return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
+  const requestId = req.method === "POST" && req.body ? req.body.requestId : null;
+  if (req.method === "POST" && (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId))) {
+    return res.status(400).json({ status: "invalid_request", message: "Identificador de execução inválido. Confirme novamente a checagem." });
   }
 
   const hasSelection = req.method === "POST" && req.body && Object.prototype.hasOwnProperty.call(req.body, "slugs");
+  const hasSnapshot = req.method === "POST" && req.body
+    && Object.prototype.hasOwnProperty.call(req.body, "snapshotHash")
+    && Object.prototype.hasOwnProperty.call(req.body, "snapshotCount");
   let selectedSlugs = null;
+  let expectedSnapshotHash = null;
+  let expectedSnapshotCount = null;
   if (hasSelection) {
     const requestedSlugs = req.body.slugs;
     if (!Array.isArray(requestedSlugs) || requestedSlugs.length === 0 || requestedSlugs.length > 500
@@ -1012,6 +1042,32 @@ async function startManualCheck(req, res) {
       return res.status(400).json({ status: "invalid_selection", message: "Selecione ao menos uma biblioteca válida." });
     }
     selectedSlugs = [...new Set(requestedSlugs)];
+  }
+  if (req.method === "POST" && !hasSnapshot) {
+    return res.status(400).json({ status: "invalid_selection", message: "Confirme novamente a lista antes de iniciar a checagem." });
+  }
+  if (hasSnapshot) {
+    if (typeof req.body.snapshotHash !== "string" || !/^[a-f0-9]{64}$/i.test(req.body.snapshotHash)
+      || !Number.isSafeInteger(req.body.snapshotCount) || req.body.snapshotCount < 1) {
+      return res.status(400).json({ status: "invalid_selection", message: "Não foi possível validar a lista confirmada. Revise a checagem." });
+    }
+    expectedSnapshotHash = req.body.snapshotHash.toLowerCase();
+    expectedSnapshotCount = req.body.snapshotCount;
+  }
+  const requestSignature = createHash("sha256").update(JSON.stringify({
+    slugs: selectedSlugs ? [...selectedSlugs].sort() : null,
+    snapshotHash: expectedSnapshotHash,
+    snapshotCount: expectedSnapshotCount,
+  }), "utf8").digest("hex");
+  const previousRequest = manualCheckRequestLedger.get(requestId);
+  if (previousRequest) {
+    if (previousRequest.signature !== requestSignature) {
+      return res.status(409).json({ status: "request_conflict", message: "Este identificador já foi usado com outra lista. Reconfirme a checagem." });
+    }
+    return res.status(202).json({ status: "started", runId: previousRequest.runId, escopo: previousRequest.escopo });
+  }
+  if (isRunning) {
+    return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
   }
 
   isRunning = true;
@@ -1031,12 +1087,22 @@ async function startManualCheck(req, res) {
     isRunning = false;
     return res.status(400).json({ status: "invalid_selection", message: "Uma ou mais bibliotecas selecionadas não existem." });
   }
+  if (expectedSnapshotHash && (pages.length !== expectedSnapshotCount || fingerprintManualPages(pages) !== expectedSnapshotHash)) {
+    isRunning = false;
+    return res.status(409).json({ status: "selection_changed", message: "A lista de bibliotecas mudou após a confirmação. Revise a lista completa e confirme outra vez." });
+  }
 
   const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const escopo = selectedSlugs ? "selecionadas" : "todas";
+  manualCheckRequestLedger.set(requestId, { signature: requestSignature, runId, escopo, state: null });
+  if (manualCheckRequestLedger.size > MANUAL_CHECK_REQUEST_LEDGER_LIMIT) {
+    manualCheckRequestLedger.delete(manualCheckRequestLedger.keys().next().value);
+  }
   manualCheckStatus = {
     runId,
+    requestId,
     status: "running",
-    escopo: selectedSlugs ? "selecionadas" : "todas",
+    escopo,
     total: 0,
     concluidos: 0,
     sucesso: 0,
@@ -1112,18 +1178,30 @@ async function startManualCheck(req, res) {
         atual: null,
         finalizadoEm: new Date().toISOString(),
       };
+      const completedRequest = manualCheckRequestLedger.get(manualCheckStatus.requestId);
+      if (completedRequest) completedRequest.state = { ...manualCheckStatus, ocupado: false };
     }
   })();
 }
 
-app.route("/api/coletar-tudo").get(startManualCheck).post(startManualCheck);
-app.get("/api/coletar-tudo/status", (_req, res) => {
-  const emExecucao = manualCheckStatus.status === "running";
+app.post("/api/coletar-tudo", startManualCheck);
+app.get("/api/coletar-tudo", (_req, res) => res.status(405).json({ status: "confirmation_required", message: "Confirme a lista de bibliotecas antes de iniciar a checagem." }));
+app.get("/api/coletar-tudo/status", (req, res) => {
+  const requestedId = typeof req.query.requestId === "string" ? req.query.requestId : null;
+  const requestEntry = requestedId ? manualCheckRequestLedger.get(requestedId) : null;
+  if (requestedId && !requestEntry) {
+    return res.status(404).json({ status: "unknown_run", message: "A execução solicitada não está mais disponível." });
+  }
+  const isCurrentRun = !!requestEntry && manualCheckStatus.requestId === requestedId;
+  const status = requestEntry
+    ? (isCurrentRun ? manualCheckStatus : requestEntry.state || manualCheckStatus)
+    : manualCheckStatus;
+  const emExecucao = status.status === "running";
   res.json({
-    ...manualCheckStatus,
-    resultados: emExecucao ? manualCheckStatus.resultados.slice(-15) : manualCheckStatus.resultados,
-    totalResultados: manualCheckStatus.resultados.length,
-    ocupado: isRunning,
+    ...status,
+    resultados: emExecucao ? status.resultados.slice(-15) : status.resultados,
+    totalResultados: status.resultados.length,
+    ocupado: isCurrentRun ? isRunning : requestedId ? false : isRunning,
   });
 });
 
@@ -2750,24 +2828,88 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .manual-check-btn:hover{background:#fff}
 .manual-check-btn:disabled{opacity:.6;cursor:wait}
 .manual-check-btn:focus-visible{outline:2px solid #fff;outline-offset:3px}
-.manual-selection{margin:0 0 14px}
-.manual-selection summary{display:inline-flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer;list-style:none}
-.manual-selection summary::-webkit-details-marker{display:none}
-.manual-selection summary:after{content:"⌄";color:var(--muted);font-size:14px;transition:transform .15s}
-.manual-selection[open] summary:after{transform:rotate(180deg)}
-.manual-selection-count{color:var(--muted);font:11px 'Space Mono',monospace}
-.manual-selection-box{max-width:680px;margin-top:10px;padding:14px;background:var(--surface);border:1px solid var(--border);border-radius:10px}
-.manual-selection-search{width:100%;margin-bottom:10px;padding:9px 11px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font:12px 'Space Grotesk',sans-serif;outline:none}
-.manual-selection-search:focus{border-color:var(--accent)}
-.manual-selection-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:2px 12px;max-height:220px;overflow:auto}
-.manual-selection-option{display:flex;align-items:center;gap:8px;min-width:0;padding:7px 5px;color:var(--text2);font-size:12px;cursor:pointer}
-.manual-selection-option input{width:14px;height:14px;flex-shrink:0;accent-color:var(--accent)}
-.manual-selection-option span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.manual-selection-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px;padding-top:10px;border-top:1px solid var(--border)}
-.manual-selection-message{color:var(--muted);font-size:11px}
-.manual-selection-submit{background:transparent;color:var(--text2);border:1px solid var(--border);border-radius:8px;padding:7px 11px;font:600 11px 'Space Grotesk',sans-serif;cursor:pointer}
-.manual-selection-submit:hover:not(:disabled){color:#fff;border-color:var(--text2)}
-.manual-selection-submit:disabled{opacity:.45;cursor:not-allowed}
+.manual-customize-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;background:transparent;color:var(--text2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;font:600 12px 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,border-color .15s,color .15s;white-space:nowrap}
+.manual-customize-btn:hover{background:var(--surface2);border-color:#85859a;color:#fff}
+.manual-customize-btn:disabled{opacity:.55;cursor:wait}
+.manual-customize-btn:focus-visible,.dialog-close:focus-visible,.dialog-primary:focus-visible,.dialog-secondary:focus-visible,.manual-report-open:focus-visible{outline:3px solid #7c6fff;outline-offset:3px}
+.selection-dialog,.confirm-dialog,.report-dialog{width:min(94vw,980px);max-height:calc(100dvh - 36px);padding:0;overflow:hidden;border:1px solid rgba(15,23,42,.12);border-radius:18px;background:#f5f6f7;color:#181b20;box-shadow:0 28px 90px rgba(0,0,0,.38);font-family:'Space Grotesk',sans-serif}
+.selection-dialog::backdrop,.confirm-dialog::backdrop,.report-dialog::backdrop{background:rgba(5,7,12,.68);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.selection-dialog[open],.confirm-dialog[open],.report-dialog[open]{animation:dialog-enter .2s cubic-bezier(.2,.8,.2,1)}
+@keyframes dialog-enter{from{opacity:0;transform:translateY(8px) scale(.99)}to{opacity:1;transform:translateY(0) scale(1)}}
+.selection-dialog-shell,.confirm-dialog-shell,.report-dialog-shell{display:flex;flex-direction:column;max-height:calc(100dvh - 36px)}
+.selection-dialog-head,.report-head{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:26px 30px 20px;background:#fff;border-bottom:1px solid #e4e6e9}
+.dialog-eyebrow{margin-bottom:8px;color:#69717b;font:600 10px 'Space Mono',monospace;letter-spacing:1.15px}
+.selection-dialog-head h2,.report-head h2{font-size:24px;line-height:1.2;font-weight:650;letter-spacing:0}
+.selection-dialog-head p,.report-head p{margin-top:7px;color:#68717b;font-size:13px;line-height:1.5}
+.dialog-close{display:grid;place-items:center;flex:0 0 34px;width:34px;height:34px;border:0;border-radius:50%;background:#f0f1f2;color:#555e68;font:400 25px/1 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,color .15s}
+.dialog-close:hover{background:#e3e5e8;color:#111}
+.selection-dialog-body{min-height:0;padding:20px 30px;overflow:auto}
+.manual-selection-search-wrap{display:flex;align-items:center;gap:10px;height:42px;margin-bottom:18px;padding:0 13px;border:1px solid #d9dde1;border-radius:10px;background:#fff;color:#7a838d}
+.manual-selection-search{width:100%;height:100%;border:0;outline:0;background:transparent;color:#20252a;font:13px 'Space Grotesk',sans-serif}
+.manual-selection-search-wrap:focus-within{border-color:#397c4b;box-shadow:0 0 0 3px rgba(57,124,75,.16)}
+.manual-selection-search::placeholder{color:#9098a1}
+.selection-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.selection-group{min-width:0;border:1px solid #dfe2e5;border-radius:12px;background:#fff;overflow:hidden}
+.selection-group>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 15px;border-bottom:1px solid #eceef0}
+.selection-group>header>div{display:flex;align-items:center;gap:10px;min-width:0}
+.selection-group h3{font-size:13px;font-weight:650;letter-spacing:0}
+.selection-group-icon{display:grid;place-items:center;width:27px;height:27px;border-radius:8px;background:#eaf2ec;color:#426d4d;font:700 11px 'Space Mono',monospace}
+.selection-group-icon-url{background:#edf0f4;color:#596775}
+.selection-group-count{color:#737c85;font:11px 'Space Mono',monospace}
+.manual-selection-list{display:flex;flex-direction:column;gap:5px;max-height:310px;min-height:104px;padding:9px;overflow:auto}
+.manual-selection-option{display:flex;align-items:center;gap:11px;min-width:0;padding:10px;border:1px solid transparent;border-radius:8px;background:#f7f8f8;color:#252a30;cursor:pointer;transition:background .14s,border-color .14s}
+.manual-selection-option:hover{background:#f0f3f0}
+.manual-selection-option:has(input:checked){border-color:#b8d0bf;background:#eff6f0}
+.manual-selection-option input{width:17px;height:17px;flex:0 0 17px;margin:0;accent-color:#397c4b}
+.manual-selection-option-copy{display:flex;flex-direction:column;gap:3px;min-width:0}
+.manual-selection-option-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
+.manual-selection-option-url{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#79828b;font:10px 'Space Mono',monospace}
+.selection-empty{display:grid;place-items:center;min-height:86px;padding:14px;color:#89919a;font-size:12px;text-align:center}
+.manual-selection-option[hidden]{display:none}
+.selection-dialog-footer,.report-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 30px;background:#fff;border-top:1px solid #e4e6e9}
+.manual-selection-message,.confirm-note{color:#68717b;font-size:12px}
+.selection-dialog-footer>div,.report-footer>div{display:flex;align-items:center;justify-content:flex-end;gap:9px}
+.dialog-primary,.dialog-secondary{min-height:38px;padding:0 15px;border:1px solid transparent;border-radius:8px;font:600 12px 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,border-color .15s,opacity .15s}
+.dialog-primary{background:#20262c;color:#fff}
+.dialog-primary:hover:not(:disabled){background:#394149}
+.dialog-primary:disabled{opacity:.42;cursor:not-allowed}
+.dialog-secondary{border-color:#d9dde1;background:#fff;color:#515a64}
+.dialog-secondary:hover{background:#f2f3f4;border-color:#c6cbd0}
+.confirm-dialog{width:min(94vw,760px)}
+.confirm-selection-summary{display:flex;align-items:center;gap:10px;padding:14px 30px;color:#333b43;font-size:12px;font-weight:600}
+.confirm-selection-summary span{display:inline-flex;gap:5px;align-items:center;padding:5px 9px;border-radius:6px;background:#e9ecee;color:#505a63;font:11px 'Space Mono',monospace}
+.confirm-selection-list{display:flex;flex-direction:column;gap:6px;max-height:min(48vh,420px);margin:0 30px 18px;padding:2px 4px 2px 0;overflow:auto}
+.confirm-selection-item{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border:1px solid #e1e4e6;border-radius:8px;background:#fff}
+.confirm-selection-item strong{color:#252b31;font-size:12px}
+.confirm-selection-item code{overflow-wrap:anywhere;color:#717b85;font:10px/1.55 'Space Mono',monospace}
+.report-dialog{width:min(94vw,920px)}
+.report-head{align-items:center;padding-bottom:18px}
+.report-head h2{font-size:22px}
+.report-status{display:flex;align-items:center;gap:9px;margin:20px 30px 14px;color:#315f3e;font-size:12px;font-weight:650}
+.report-status:before{content:"";width:8px;height:8px;border-radius:50%;background:#438c55;box-shadow:0 0 0 4px #e2efe4}
+.report-status.has-failures{color:#895f2d}
+.report-status.has-failures:before{background:#c58a36;box-shadow:0 0 0 4px #f6eddd}
+.report-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 30px 22px}
+.report-metric{min-width:0;padding:14px;border:1px solid #e0e3e5;border-radius:10px;background:#fff}
+.report-metric-label{color:#77808a;font-size:10px;font-weight:600;text-transform:uppercase}
+.report-metric-value{margin-top:7px;color:#222930;font:600 23px/1 'Space Mono',monospace}
+.report-results-section{margin:0 30px 20px;border:1px solid #dfe2e5;border-radius:11px;background:#fff;overflow:hidden}
+.report-results-section>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 15px;border-bottom:1px solid #e8eaec}
+.report-results-section h3{font-size:13px;font-weight:650}
+.report-results-section>header span{color:#79828b;font:10px 'Space Mono',monospace}
+.report-results{display:flex;flex-direction:column;max-height:min(40vh,330px);overflow:auto}
+.report-result-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 15px;border-bottom:1px solid #eef0f1}
+.report-result-row:last-child{border-bottom:0}
+.report-result-copy{display:flex;flex-direction:column;gap:4px;min-width:0}
+.report-result-name{overflow:hidden;color:#2b3137;font-size:12px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}
+.report-result-detail{overflow-wrap:anywhere;color:#77808a;font-size:10px;line-height:1.45}
+.report-result-value{white-space:nowrap;color:#397449;font:600 12px 'Space Mono',monospace}
+.report-result-value.is-failed{color:#a85c4f}
+.report-empty{padding:22px;color:#78818b;font-size:12px;text-align:center}
+.report-footer{font-size:10px;color:#7c858e}
+.manual-report-open{margin-top:12px;padding:0;border:0;background:transparent;color:#c8c7ff;font:600 11px 'Space Grotesk',sans-serif;cursor:pointer}
+.manual-report-open[hidden]{display:none}
+.manual-report-open:hover{text-decoration:underline}
 .manual-run-panel{margin:0 0 20px;padding:14px 16px;background:rgba(255,255,255,.035);border:1px solid var(--border);border-radius:12px}
 .manual-run-panel[hidden]{display:none}
 .manual-run-head{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px}
@@ -2781,6 +2923,9 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .manual-run-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)}
 .manual-run-result{white-space:nowrap;color:var(--up);font-family:'Space Mono',monospace}
 .manual-run-result.is-failed{color:var(--down)}
+@media(max-width:760px){.hdr>div:last-child>div:last-child{flex-wrap:wrap;justify-content:flex-end}.selection-dialog-head,.report-head{padding:21px 20px 16px}.selection-dialog-body{padding:16px 20px}.selection-groups{grid-template-columns:1fr}.manual-selection-list{max-height:230px}.selection-dialog-footer,.report-footer{align-items:flex-start;flex-direction:column;padding:14px 20px}.selection-dialog-footer>div,.report-footer>div{width:100%}.selection-dialog-footer .dialog-primary,.report-footer .dialog-primary{flex:1}.confirm-selection-summary{flex-wrap:wrap;padding:12px 20px}.confirm-selection-list{margin:0 20px 16px}.report-status{margin:16px 20px 12px}.report-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 20px 16px}.report-results-section{margin:0 20px 16px}}
+@media(max-width:480px){.selection-dialog,.confirm-dialog,.report-dialog{width:calc(100vw - 20px);max-height:calc(100dvh - 20px);border-radius:14px}.selection-dialog-shell,.confirm-dialog-shell,.report-dialog-shell{max-height:calc(100dvh - 20px)}.selection-dialog-head h2,.report-head h2{font-size:20px}.selection-dialog-head p,.report-head p{font-size:12px}.selection-dialog-footer>div{display:grid;grid-template-columns:1fr 1fr}.confirm-note{font-size:11px}.report-metric{padding:11px}.report-metric-value{font-size:20px}.report-footer>div{display:grid;grid-template-columns:1fr 1fr}.report-result-row{padding:9px 11px}}
+@media(prefers-reduced-motion:reduce){.selection-dialog[open],.confirm-dialog[open],.report-dialog[open]{animation:none}}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:0 0 8px var(--up)}
 .section-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:0 0 12px 2px;display:flex;align-items:center;gap:8px}
 .scaling-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:26px}
@@ -2926,35 +3071,70 @@ tbody tr:hover td{background:var(--surface2)}
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 1-2.34-5.66L20 7"/></svg>
         <span id="manual-check-label">Checar todas</span>
       </button>
+      <button type="button" class="manual-customize-btn" id="manual-customize-button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="m15 17 2 2 4-4"/></svg>
+        Personalizar checagem
+      </button>
       <a href="/admin" class="hdr-admin-btn">⚙️ Ir para Admin</a>
       <a href="/funis" class="hdr-admin-btn">🔀 Ver Mapa de Funis</a>
     </div>
   </div>
 </div>
 
-<section class="manual-run-panel" id="manual-run-panel" hidden role="status" aria-live="polite">
+<section class="manual-run-panel" id="manual-run-panel" hidden>
   <div class="manual-run-head">
     <div>
       <div class="manual-run-title" id="manual-run-title">Checagem manual</div>
-      <div class="manual-run-current" id="manual-run-current"></div>
+      <div class="manual-run-current" id="manual-run-current" role="status" aria-live="polite"></div>
     </div>
     <div class="manual-run-count" id="manual-run-count"></div>
   </div>
   <div class="manual-run-track" role="progressbar" aria-label="Progresso da checagem" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="manual-run-progress"></span></div>
   <div class="manual-run-results" id="manual-run-results"></div>
+  <button type="button" class="manual-report-open" id="manual-report-open" hidden>Ver relatório completo</button>
 </section>
 
-<details class="manual-selection" id="manual-selection">
-  <summary>Personalizar checagem <span class="manual-selection-count" id="manual-selection-count">0 selecionadas</span></summary>
-  <div class="manual-selection-box">
-    <input class="manual-selection-search" id="manual-selection-search" type="search" placeholder="Buscar biblioteca pelo nome..." aria-label="Buscar biblioteca pelo nome">
-    <div class="manual-selection-list" id="manual-selection-list" role="group" aria-label="Bibliotecas monitoradas">Carregando bibliotecas...</div>
-    <div class="manual-selection-footer">
-      <span class="manual-selection-message" id="manual-selection-message">Selecione uma ou mais bibliotecas.</span>
-      <button type="button" class="manual-selection-submit" id="manual-check-selected" disabled>Checar selecionadas</button>
+<dialog class="selection-dialog" id="manual-selection-dialog" aria-labelledby="manual-selection-title">
+  <div class="selection-dialog-shell">
+    <header class="selection-dialog-head">
+      <div><div class="dialog-eyebrow">ESCOPO DA COLETA</div><h2 id="manual-selection-title">Personalizar checagem</h2><p>Escolha exatamente o que deseja conferir agora.</p></div>
+      <button type="button" class="dialog-close" id="manual-selection-close" aria-label="Fechar seleção">×</button>
+    </header>
+    <div class="selection-dialog-body">
+      <label class="manual-selection-search-wrap"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input class="manual-selection-search" id="manual-selection-search" type="search" placeholder="Buscar página ou URL monitorada" aria-label="Buscar página ou URL monitorada"></label>
+      <div class="selection-groups">
+        <section class="selection-group" aria-labelledby="manual-pages-title">
+          <header><div><span class="selection-group-icon">P</span><h3 id="manual-pages-title">Páginas Monitoradas</h3></div><span class="selection-group-count" id="manual-pages-count">0</span></header>
+          <div class="manual-selection-list" id="manual-pages-list" role="group" aria-label="Páginas monitoradas"><div class="selection-empty">Carregando páginas...</div></div>
+        </section>
+        <section class="selection-group" aria-labelledby="manual-urls-title">
+          <header><div><span class="selection-group-icon selection-group-icon-url">U</span><h3 id="manual-urls-title">URLs Monitoradas</h3></div><span class="selection-group-count" id="manual-urls-count">0</span></header>
+          <div class="manual-selection-list" id="manual-urls-list" role="group" aria-label="URLs monitoradas"><div class="selection-empty">Carregando URLs...</div></div>
+        </section>
+      </div>
     </div>
+    <footer class="selection-dialog-footer"><span class="manual-selection-message" id="manual-selection-message">Nenhum item selecionado</span><div><button type="button" class="dialog-secondary" id="manual-selection-cancel">Cancelar</button><button type="button" class="dialog-primary" id="manual-check-selected" disabled>Realizar checagem</button></div></footer>
   </div>
-</details>
+</dialog>
+
+<dialog class="confirm-dialog" id="manual-confirm-dialog" aria-labelledby="manual-confirm-title" aria-describedby="manual-confirm-description">
+  <div class="confirm-dialog-shell">
+    <header class="selection-dialog-head"><div><div class="dialog-eyebrow">CONFIRMAÇÃO NECESSÁRIA</div><h2 id="manual-confirm-title">Conferir estes itens?</h2><p id="manual-confirm-description"></p></div><button type="button" class="dialog-close" id="manual-confirm-close" aria-label="Voltar para seleção">×</button></header>
+    <div class="confirm-selection-summary" id="manual-confirm-summary"></div>
+    <div class="confirm-selection-list" id="manual-confirm-list"></div>
+    <footer class="selection-dialog-footer"><span class="confirm-note">A coleta só começa após sua confirmação.</span><div><button type="button" class="dialog-secondary" id="manual-confirm-back">Voltar</button><button type="button" class="dialog-primary" id="manual-confirm-start">Confirmar e iniciar</button></div></footer>
+  </div>
+</dialog>
+
+<dialog class="report-dialog" id="manual-report-dialog" aria-labelledby="manual-report-title" aria-describedby="manual-report-subtitle manual-report-status">
+  <div class="report-dialog-shell">
+    <header class="report-head"><div><div class="dialog-eyebrow">LOWTICKET MONITOR · RESULTADO</div><h2 id="manual-report-title">Relatório da checagem</h2><p id="manual-report-subtitle"></p></div><button type="button" class="dialog-close" id="manual-report-close" aria-label="Fechar relatório">×</button></header>
+    <div class="report-status" id="manual-report-status"></div>
+    <div class="report-metrics" id="manual-report-metrics"></div>
+    <section class="report-results-section"><header><h3>Resultado por biblioteca</h3><span id="manual-report-results-count"></span></header><div class="report-results" id="manual-report-results"></div></section>
+    <footer class="report-footer"><span id="manual-report-timestamp"></span><div><button type="button" class="dialog-secondary" id="manual-report-dismiss">Fechar</button><button type="button" class="dialog-primary" id="manual-report-refresh">Atualizar dashboard</button></div></footer>
+  </div>
+</dialog>
 
 <div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
 
@@ -3473,12 +3653,21 @@ render(D_DOM,HD_DOM,"dom_");
 
 const manualCheckButton=document.getElementById("manual-check-button");
 const manualCheckLabel=document.getElementById("manual-check-label");
-const manualSelection=document.getElementById("manual-selection");
-const manualSelectionList=document.getElementById("manual-selection-list");
+const manualCustomizeButton=document.getElementById("manual-customize-button");
+const manualSelectionDialog=document.getElementById("manual-selection-dialog");
+const manualPagesList=document.getElementById("manual-pages-list");
+const manualUrlsList=document.getElementById("manual-urls-list");
 const manualSelectionSearch=document.getElementById("manual-selection-search");
-const manualSelectionCount=document.getElementById("manual-selection-count");
+const manualPagesCount=document.getElementById("manual-pages-count");
+const manualUrlsCount=document.getElementById("manual-urls-count");
 const manualSelectionMessage=document.getElementById("manual-selection-message");
 const manualCheckSelectedButton=document.getElementById("manual-check-selected");
+const manualConfirmDialog=document.getElementById("manual-confirm-dialog");
+const manualConfirmTitle=document.getElementById("manual-confirm-title");
+const manualConfirmDescription=document.getElementById("manual-confirm-description");
+const manualConfirmSummary=document.getElementById("manual-confirm-summary");
+const manualConfirmList=document.getElementById("manual-confirm-list");
+const manualConfirmStart=document.getElementById("manual-confirm-start");
 const manualRunPanel=document.getElementById("manual-run-panel");
 const manualRunTitle=document.getElementById("manual-run-title");
 const manualRunCurrent=document.getElementById("manual-run-current");
@@ -3486,6 +3675,14 @@ const manualRunCount=document.getElementById("manual-run-count");
 const manualRunProgress=document.getElementById("manual-run-progress");
 const manualRunTrack=manualRunProgress.parentElement;
 const manualRunResults=document.getElementById("manual-run-results");
+const manualReportOpen=document.getElementById("manual-report-open");
+const manualReportDialog=document.getElementById("manual-report-dialog");
+const manualReportSubtitle=document.getElementById("manual-report-subtitle");
+const manualReportStatus=document.getElementById("manual-report-status");
+const manualReportMetrics=document.getElementById("manual-report-metrics");
+const manualReportResultsCount=document.getElementById("manual-report-results-count");
+const manualReportResults=document.getElementById("manual-report-results");
+const manualReportTimestamp=document.getElementById("manual-report-timestamp");
 const manualStatusLabels={
   ok:"Conferida",
   ok_zero:"0 anúncios",
@@ -3496,77 +3693,276 @@ const manualStatusLabels={
   falha_gravacao:"Falha ao salvar",
   falha_execucao:"Falha na execução",
 };
+const validManualCheckStates=new Set(["idle","running","completed","completed_with_errors","failed"]);
+const validManualResultStates=new Set(Object.keys(manualStatusLabels));
+const MANUAL_START_RETRY_WINDOW_MS=60_000;
 let dashboardReloadingRunId=null;
 let manualSelectionLoaded=false;
+let manualPages=[];
+let pendingManualSlugs=[];
+let pendingManualSnapshot=[];
+let pendingManualRun=null;
+let manualRequestTrackingId=null;
+let manualRetryTimer=null;
+const MANUAL_SELECTION_LIMIT=500;
 
 function selectedManualSlugs(){
-  return Array.from(manualSelectionList.querySelectorAll("input[type=checkbox]:checked"),function(input){return input.value});
+  return Array.from(manualSelectionDialog.querySelectorAll("input[type=checkbox]:checked"),function(input){return input.value});
+}
+
+async function fingerprintManualSnapshot(snapshot){
+  const canonical=snapshot
+    .map(page=>[page.slug,page.nome,page.url])
+    .sort((left,right)=>left[0]<right[0]?-1:left[0]>right[0]?1:0);
+  const digest=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(JSON.stringify(canonical)));
+  return Array.from(new Uint8Array(digest),byte=>byte.toString(16).padStart(2,"0")).join("");
 }
 
 function updateManualSelectionCount(){
   const total=selectedManualSlugs().length;
-  manualSelectionCount.textContent=total+" selecionada"+(total===1?"":"s");
-  manualSelectionMessage.textContent=total?total+" biblioteca"+(total===1?"":"s")+" selecionada"+(total===1?"":"s")+".":"Selecione uma ou mais bibliotecas.";
-  manualCheckSelectedButton.textContent="Checar selecionadas ("+total+")";
+  for(const checkbox of manualSelectionDialog.querySelectorAll("input[type=checkbox]")){
+    checkbox.disabled=total>=MANUAL_SELECTION_LIMIT&&!checkbox.checked;
+  }
+  manualSelectionMessage.textContent=total>=MANUAL_SELECTION_LIMIT?"Limite de 500 itens por checagem personalizada atingido.":total?total+" item"+(total===1?"":"s")+" selecionado"+(total===1?"":"s"):"Nenhum item selecionado";
+  manualCheckSelectedButton.textContent="Realizar checagem · "+total;
   manualCheckSelectedButton.disabled=total===0||manualCheckButton.disabled;
 }
 
 function renderManualSelection(pages){
-  manualSelectionList.replaceChildren();
-  if(!pages.length){
-    manualSelectionList.textContent="Nenhuma biblioteca cadastrada.";
-    return;
+  manualPages=[...pages].sort((a,b)=>a.nome.localeCompare(b.nome,"pt-BR"));
+  const groups=[
+    {items:manualPages.filter(page=>page.tipo!=="dominio"),list:manualPagesList,count:manualPagesCount,empty:"Nenhuma página monitorada cadastrada."},
+    {items:manualPages.filter(page=>page.tipo==="dominio"),list:manualUrlsList,count:manualUrlsCount,empty:"Nenhuma URL monitorada cadastrada."},
+  ];
+  for(const group of groups){
+    group.list.replaceChildren();
+    group.count.textContent=String(group.items.length);
+    if(!group.items.length){
+      const empty=document.createElement("div");
+      empty.className="selection-empty";
+      empty.textContent=group.empty;
+      group.list.appendChild(empty);
+      continue;
+    }
+    group.items.forEach(function(page){
+      const label=document.createElement("label");
+      label.className="manual-selection-option";
+      label.dataset.search=(page.nome+" "+page.tipo+" "+page.url).toLowerCase();
+      const checkbox=document.createElement("input");
+      checkbox.type="checkbox";
+      checkbox.value=page.slug;
+      checkbox.setAttribute("aria-label","Selecionar "+page.nome);
+      checkbox.addEventListener("change",updateManualSelectionCount);
+      const copy=document.createElement("span");
+      copy.className="manual-selection-option-copy";
+      const name=document.createElement("span");
+      name.className="manual-selection-option-name";
+      name.textContent=page.nome;
+      const url=document.createElement("span");
+      url.className="manual-selection-option-url";
+      url.textContent=page.url;
+      copy.append(name,url);
+      label.append(checkbox,copy);
+      group.list.appendChild(label);
+    });
   }
-  pages.forEach(function(page){
-    const label=document.createElement("label");
-    label.className="manual-selection-option";
-    label.dataset.search=(page.nome+" "+page.tipo).toLowerCase();
-    const checkbox=document.createElement("input");
-    checkbox.type="checkbox";
-    checkbox.value=page.slug;
-    checkbox.setAttribute("aria-label","Selecionar "+page.nome);
-    checkbox.addEventListener("change",updateManualSelectionCount);
-    const name=document.createElement("span");
-    name.textContent=page.nome;
-    label.append(checkbox,name);
-    manualSelectionList.appendChild(label);
-  });
   updateManualSelectionCount();
 }
 
-async function loadManualSelection(){
-  if(manualSelectionLoaded)return;
+async function loadManualSelection(force=false){
+  if(manualSelectionLoaded&&!force)return;
   manualSelectionLoaded=true;
   try{
     const response=await fetch("/api/paginas",{cache:"no-store"});
     if(!response.ok)throw new Error("Não foi possível carregar as bibliotecas.");
     const pages=await response.json();
+    if(!Array.isArray(pages))throw new Error("A lista de bibliotecas está inválida.");
     renderManualSelection(pages);
   }catch(e){
     manualSelectionLoaded=false;
-    manualSelectionList.textContent="Falha ao carregar a lista. Abra novamente para tentar.";
+    for(const list of [manualPagesList,manualUrlsList]){
+      const error=document.createElement("div");
+      error.className="selection-empty";
+      error.textContent="Falha ao carregar a lista. Feche e abra para tentar novamente.";
+      list.replaceChildren(error);
+    }
   }
 }
 
-manualSelection.addEventListener("toggle",function(){
-  if(manualSelection.open)loadManualSelection();
+manualCustomizeButton.addEventListener("click",function(){
+  manualSelectionDialog.showModal();
+  manualSelectionSearch.focus();
+  loadManualSelection();
 });
+document.getElementById("manual-selection-close").addEventListener("click",function(){manualSelectionDialog.close()});
+document.getElementById("manual-selection-cancel").addEventListener("click",function(){manualSelectionDialog.close()});
 
 manualSelectionSearch.addEventListener("input",function(){
   const term=manualSelectionSearch.value.trim().toLowerCase();
-  manualSelectionList.querySelectorAll(".manual-selection-option").forEach(function(option){
+  manualSelectionDialog.querySelectorAll(".manual-selection-option").forEach(function(option){
     option.hidden=term!==""&&!option.dataset.search.includes(term);
   });
 });
 
+function openManualConfirmation(slugs,scope){
+  const selected=scope==="todas"?[...manualPages]:slugs.map(slug=>manualPages.find(page=>page.slug===slug)).filter(Boolean);
+  if(!selected.length)return;
+  pendingManualSlugs=scope==="todas"?null:selected.map(page=>page.slug);
+  pendingManualSnapshot=selected.map(page=>({slug:page.slug,nome:page.nome,url:page.url}));
+  const pages=selected.filter(page=>page.tipo!=="dominio");
+  const urls=selected.filter(page=>page.tipo==="dominio");
+  manualConfirmTitle.textContent=scope==="todas"?"Confirmar checagem de todas?":"Confirmar checagem personalizada?";
+  manualConfirmDescription.textContent=scope==="todas"?"Serão checadas todas as "+selected.length+" bibliotecas monitoradas. Revise a lista completa antes de iniciar.":"A checagem vai consultar exatamente estes "+selected.length+" itens. Revise nomes e URLs antes de iniciar.";
+  manualConfirmSummary.replaceChildren();
+  for(const label of [selected.length+" selecionado"+(selected.length===1?"":"s"),pages.length+" página"+(pages.length===1?"":"s"),urls.length+" URL"+(urls.length===1?"":"s")]){
+    const badge=document.createElement("span");
+    badge.textContent=label;
+    manualConfirmSummary.appendChild(badge);
+  }
+  manualConfirmList.replaceChildren();
+  for(const page of selected){
+    const row=document.createElement("div");
+    row.className="confirm-selection-item";
+    const name=document.createElement("strong");
+    name.textContent=(page.tipo==="dominio"?"URL monitorada · ":"Página monitorada · ")+page.nome;
+    const url=document.createElement("code");
+    url.textContent=page.url;
+    row.append(name,url);
+    manualConfirmList.appendChild(row);
+  }
+  manualConfirmDialog.showModal();
+}
+
+manualCheckSelectedButton.addEventListener("click",function(){
+  const slugs=selectedManualSlugs();
+  if(!slugs.length)return;
+  openManualConfirmation(slugs,"selecionadas");
+});
+
+async function openAllManualConfirmation(){
+  if(manualCheckButton.disabled)return;
+  manualCheckButton.disabled=true;
+  manualCustomizeButton.disabled=true;
+  manualCheckLabel.textContent="Preparando...";
+  try{
+    await loadManualSelection(true);
+    if(!manualSelectionLoaded)throw new Error("Não foi possível carregar as bibliotecas. Tente novamente.");
+    if(!manualPages.length)throw new Error("Nenhuma biblioteca monitorada está cadastrada.");
+    openManualConfirmation(null,"todas");
+  }catch(error){
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Não foi possível preparar a checagem";
+    manualRunCurrent.textContent=error.message;
+    manualRunCount.textContent="";
+    manualRunResults.replaceChildren();
+  }finally{
+    manualCheckButton.disabled=false;
+    manualCustomizeButton.disabled=false;
+    manualCheckLabel.textContent="Checar todas";
+    updateManualSelectionCount();
+  }
+}
+
+document.getElementById("manual-confirm-close").addEventListener("click",function(){manualConfirmDialog.close()});
+document.getElementById("manual-confirm-back").addEventListener("click",function(){manualConfirmDialog.close()});
+manualConfirmStart.addEventListener("click",function(){
+  const slugs=pendingManualSlugs===null?null:[...pendingManualSlugs];
+  const snapshot=[...pendingManualSnapshot];
+  if(!snapshot.length)return;
+  pendingManualSlugs=[];
+  pendingManualSnapshot=[];
+  manualConfirmDialog.close();
+  if(manualSelectionDialog.open)manualSelectionDialog.close();
+  startDashboardCheck(slugs,snapshot);
+});
+
+function renderManualReport(state){
+  const resultados=state.resultados||[];
+  const total=Number(state.total)||0;
+  const sucesso=Number(state.sucesso)||0;
+  const falha=Number(state.falha)||0;
+  const inicio=state.iniciadoEm?new Date(state.iniciadoEm):null;
+  const fim=state.finalizadoEm?new Date(state.finalizadoEm):null;
+  const duracao=inicio&&fim?Math.max(0,fim.getTime()-inicio.getTime()):null;
+  const totalSegundos=duracao===null?null:Math.round(duracao/1000);
+  const duracaoLabel=totalSegundos===null?"":totalSegundos<60?totalSegundos+" s":Math.floor(totalSegundos/60)+" min "+(totalSegundos%60)+" s";
+  const escopo=state.escopo==="selecionadas"?"Seleção personalizada":"Todas as monitoradas";
+  const dataFim=fim&&!Number.isNaN(fim.getTime())?fim.toLocaleString("pt-BR",{dateStyle:"long",timeStyle:"short"}):"Horário indisponível";
+  manualReportSubtitle.textContent=escopo+" · "+dataFim;
+  const hasExecutionError=state.status==="completed_with_errors"||state.status==="failed";
+  manualReportStatus.classList.toggle("has-failures",falha>0||hasExecutionError);
+  manualReportStatus.textContent=state.status==="failed"?"Execução interrompida":state.status==="completed_with_errors"?(falha>0?"Checagem concluída com falhas":state.erro||"Checagem concluída com falhas"):falha>0?"Checagem concluída com falhas":"Checagem concluída";
+  manualReportMetrics.replaceChildren();
+  const metricas=[
+    ["No escopo",total],
+    ["Concluídas",Number(state.concluidos)||0],
+    ["Com sucesso",sucesso],
+    ["Com falha",falha],
+  ];
+  for(const [label,value] of metricas){
+    const metric=document.createElement("div");
+    metric.className="report-metric";
+    const metricLabel=document.createElement("div");
+    metricLabel.className="report-metric-label";
+    metricLabel.textContent=label;
+    const metricValue=document.createElement("div");
+    metricValue.className="report-metric-value";
+    metricValue.textContent=Number(value).toLocaleString("pt-BR");
+    metric.append(metricLabel,metricValue);
+    manualReportMetrics.appendChild(metric);
+  }
+  manualReportResultsCount.textContent=resultados.length+" de "+total+" itens";
+  manualReportResults.replaceChildren();
+  if(!resultados.length){
+    const empty=document.createElement("div");
+    empty.className="report-empty";
+    empty.textContent=state.erro||"Nenhum resultado foi registrado nesta execução.";
+    manualReportResults.appendChild(empty);
+  }
+  for(const item of resultados){
+    const row=document.createElement("div");
+    row.className="report-result-row";
+    const copy=document.createElement("div");
+    copy.className="report-result-copy";
+    const name=document.createElement("span");
+    name.className="report-result-name";
+    name.textContent=item.nome||item.slug||"Biblioteca sem nome";
+    const detail=document.createElement("span");
+    detail.className="report-result-detail";
+    const ok=item.count!==null&&item.count!==undefined;
+    detail.textContent=ok?"Coleta concluída com sucesso":(item.falha||manualStatusLabels[item.status]||"Não foi possível concluir a coleta.");
+    const value=document.createElement("span");
+    value.className="report-result-value";
+    value.textContent=ok?Number(item.count).toLocaleString("pt-BR")+" anúncios":(manualStatusLabels[item.status]||"Falhou");
+    if(!ok)value.classList.add("is-failed");
+    copy.append(name,detail);
+    row.append(copy,value);
+    manualReportResults.appendChild(row);
+  }
+  manualReportTimestamp.textContent="Início: "+(inicio&&!Number.isNaN(inicio.getTime())?inicio.toLocaleString("pt-BR"):"indisponível")+(duracaoLabel?" · Duração: "+duracaoLabel:"");
+}
+
+manualReportOpen.addEventListener("click",function(){
+  if(!manualReportDialog.open)manualReportDialog.showModal();
+});
+document.getElementById("manual-report-close").addEventListener("click",function(){manualReportDialog.close()});
+document.getElementById("manual-report-dismiss").addEventListener("click",function(){manualReportDialog.close()});
+document.getElementById("manual-report-refresh").addEventListener("click",function(){
+  manualReportDialog.close();
+  window.location.reload();
+});
+
 function renderManualCheck(state){
   const estaRodando=state.status==="running";
-  const ocupadoSemRelatorio=state.ocupado&&!estaRodando;
+  const finalizado=state.status==="completed"||state.status==="completed_with_errors"||state.status==="failed";
+  const ocupadoSemRelatorio=state.ocupado&&!estaRodando&&!finalizado;
   manualCheckButton.disabled=estaRodando||state.ocupado;
+  manualCustomizeButton.disabled=estaRodando||state.ocupado;
   manualCheckLabel.textContent=estaRodando?"Conferindo...":"Checar todas";
   updateManualSelectionCount();
   if(state.status==="idle"&&!state.ocupado){
     manualRunPanel.hidden=true;
+    manualReportOpen.hidden=true;
     return;
   }
   manualRunPanel.hidden=false;
@@ -3581,13 +3977,13 @@ function renderManualCheck(state){
   }
 
   const progresso=state.total?Math.round((state.concluidos/state.total)*100):0;
-  const finalizado=state.status==="completed"||state.status==="completed_with_errors"||state.status==="failed";
   manualRunTitle.textContent=state.status==="running"?(state.escopo==="selecionadas"?"Conferindo selecionadas":"Conferindo bibliotecas"):state.status==="completed"?"Checagem concluída":state.status==="failed"?"Não foi possível concluir a checagem":"Checagem concluída com falhas";
   manualRunCurrent.textContent=state.status==="running"?(state.atual?"Conferindo: "+state.atual:"Preparando coleta..."):(state.erro||"Resultado atualizado na dashboard.");
   manualRunCount.textContent=state.concluidos+" / "+state.total+" · "+state.sucesso+" ok · "+state.falha+" falhas";
   manualRunProgress.style.width=progresso+"%";
   manualRunTrack.setAttribute("aria-valuenow",String(progresso));
   manualRunResults.replaceChildren();
+  manualReportOpen.hidden=!finalizado;
   for(const item of state.resultados||[]){
     const row=document.createElement("div");
     row.className="manual-run-row";
@@ -3604,26 +4000,48 @@ function renderManualCheck(state){
     manualRunResults.appendChild(row);
   }
 
-  if(finalizado&&state.runId&&dashboardReloadingRunId!==state.runId){
+  if(finalizado){
+    renderManualReport(state);
     try{
-      const refreshKey="lowticket-manual-check-refresh";
-      if(sessionStorage.getItem(refreshKey)!==state.runId){
-        sessionStorage.setItem(refreshKey,state.runId);
-        dashboardReloadingRunId=state.runId;
-        setTimeout(()=>window.location.reload(),700);
+      const reportKey="lowticket-manual-check-report-seen";
+      if(state.runId&&sessionStorage.getItem(reportKey)!==state.runId){
+        sessionStorage.setItem(reportKey,state.runId);
+        if(!manualReportDialog.open)manualReportDialog.showModal();
       }
-    }catch(e){}
+    }catch(e){if(!manualReportDialog.open)manualReportDialog.showModal()}
   }
 }
 
 async function updateManualCheck(){
   try{
-    const response=await fetch("/api/coletar-tudo/status",{cache:"no-store"});
+    const statusUrl=manualRequestTrackingId?"/api/coletar-tudo/status?requestId="+encodeURIComponent(manualRequestTrackingId):"/api/coletar-tudo/status";
+    const response=await fetch(statusUrl,{cache:"no-store"});
     if(!response.ok)throw new Error("Falha ao consultar status");
     const state=await response.json();
+    if(!state||!validManualCheckStates.has(state.status)||typeof state.ocupado!=="boolean"||!Array.isArray(state.resultados)
+      ||![state.total,state.concluidos,state.sucesso,state.falha].every(Number.isFinite)
+      ||state.resultados.some(item=>!item||typeof item!=="object"||typeof item.slug!=="string"||typeof item.nome!=="string"||!validManualResultStates.has(item.status)
+        ||(item.count===null?item.status==="ok"||item.status==="ok_zero":!Number.isFinite(item.count)||item.status!=="ok"&&item.status!=="ok_zero")))throw new Error("Resposta de status inválida");
+    if(pendingManualRun){
+      if(state.requestId===pendingManualRun.requestId){
+        manualRequestTrackingId=pendingManualRun.requestId;
+        pendingManualRun=null;
+      }else if(state.ocupado){
+        renderManualCheck({status:"idle",ocupado:true,resultados:[]});
+        setTimeout(updateManualCheck,1500);
+        return;
+      }else if(!state.ocupado){
+        showManualStartPending();
+        schedulePendingManualRetry();
+        return;
+      }
+    }
     renderManualCheck(state);
     if(state.status==="running"||state.ocupado)setTimeout(updateManualCheck,1500);
   }catch(e){
+    manualCheckButton.disabled=true;
+    manualCustomizeButton.disabled=true;
+    manualCheckSelectedButton.disabled=true;
     manualRunPanel.hidden=false;
     manualRunTitle.textContent="Não foi possível consultar a checagem";
     manualRunCurrent.textContent="Atualize a página para tentar novamente.";
@@ -3631,30 +4049,126 @@ async function updateManualCheck(){
   }
 }
 
-async function startDashboardCheck(slugs){
+function schedulePendingManualRetry(){
+  if(!pendingManualRun)return;
+  if(Date.now()-pendingManualRun.startedAt>=MANUAL_START_RETRY_WINDOW_MS){
+    if(manualRetryTimer!==null){
+      clearTimeout(manualRetryTimer);
+      manualRetryTimer=null;
+    }
+    manualRunCurrent.textContent="Ainda não foi possível confirmar a execução. A tela continuará consultando o status; não inicie outra checagem.";
+    setTimeout(updateManualCheck,3000);
+    return;
+  }
+  if(manualRetryTimer!==null)return;
+  const remaining=MANUAL_START_RETRY_WINDOW_MS-(Date.now()-pendingManualRun.startedAt);
+  manualRetryTimer=setTimeout(function(){
+    manualRetryTimer=null;
+    if(!pendingManualRun)return;
+    if(Date.now()-pendingManualRun.startedAt>=MANUAL_START_RETRY_WINDOW_MS){
+      schedulePendingManualRetry();
+      return;
+    }
+    startDashboardCheck(pendingManualRun.slugs,pendingManualRun.snapshot,pendingManualRun.requestId);
+  },Math.min(1800,remaining));
+}
+
+function showManualStartPending(){
+  manualRunPanel.hidden=false;
+  manualRunTitle.textContent="Confirmando o início da checagem";
+  manualRunCurrent.textContent="A resposta do servidor não foi conclusiva. Consultando o status antes de permitir outra tentativa.";
+  manualRunCount.textContent="";
+  manualRunResults.replaceChildren();
+}
+
+async function startDashboardCheck(slugs,snapshot,requestId=crypto.randomUUID()){
+  if(manualRetryTimer!==null){
+    clearTimeout(manualRetryTimer);
+    manualRetryTimer=null;
+  }
+  if(!pendingManualRun||pendingManualRun.requestId!==requestId){
+    manualRequestTrackingId=null;
+    pendingManualRun={slugs:slugs?[...slugs]:null,snapshot:snapshot.map(item=>({...item})),requestId:requestId,startedAt:Date.now()};
+  }
   manualCheckButton.disabled=true;
+  manualCustomizeButton.disabled=true;
   manualCheckSelectedButton.disabled=true;
   manualCheckLabel.textContent="Iniciando...";
+  let requestMayHaveStarted=false;
   try{
-    const options={method:"POST"};
-    if(slugs){
-      options.headers={"Content-Type":"application/json"};
-      options.body=JSON.stringify({slugs:slugs});
-    }
+    if(!Array.isArray(snapshot)||!snapshot.length)throw new Error("A lista confirmada está vazia. Reabra a confirmação e tente novamente.");
+    const payload={...(slugs?{slugs:slugs}:{}),requestId:requestId,snapshotHash:await fingerprintManualSnapshot(snapshot),snapshotCount:snapshot.length};
+    const options={method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)};
+    requestMayHaveStarted=true;
     const response=await fetch("/api/coletar-tudo",options);
-    const data=await response.json();
+    let data;
+    try{
+      data=await response.json();
+    }catch{
+      if(response.status>=400&&response.status<500&&response.status!==408){
+        requestMayHaveStarted=false;
+        throw new Error("O servidor recusou a solicitação ("+response.status+"). A checagem não foi iniciada.");
+      }
+      throw new Error("O servidor retornou uma resposta inconclusiva.");
+    }
     if(response.status===409){
+      if(data.status==="selection_changed"){
+        pendingManualRun=null;
+        manualRequestTrackingId=null;
+        manualCheckButton.disabled=false;
+        manualCustomizeButton.disabled=false;
+        manualCheckLabel.textContent="Checar todas";
+        manualSelectionLoaded=false;
+        manualPages=[];
+        manualRunPanel.hidden=false;
+        manualRunTitle.textContent="A seleção precisa ser revisada";
+        manualRunCurrent.textContent=data.message||"Os dados mudaram. Abra a personalização e confirme novamente.";
+        manualRunCount.textContent="";
+        manualRunResults.replaceChildren();
+        return;
+      }
+      if(data.status==="request_conflict"){
+        pendingManualRun=null;
+        manualRequestTrackingId=null;
+        manualCheckButton.disabled=false;
+        manualCustomizeButton.disabled=false;
+        manualCheckLabel.textContent="Checar todas";
+        manualRunPanel.hidden=false;
+        manualRunTitle.textContent="Não foi possível confirmar esta execução";
+        manualRunCurrent.textContent=data.message||"Reabra a confirmação e tente novamente.";
+        return;
+      }
       renderManualCheck({status:"idle",ocupado:true,resultados:[]});
       setTimeout(updateManualCheck,1800);
       return;
     }
-    if(!response.ok)throw new Error(data.message||"Não foi possível iniciar a checagem.");
+    if(!response.ok){
+      requestMayHaveStarted=response.status>=500||response.status===408;
+      if(response.status===500&&data.status==="error")requestMayHaveStarted=false;
+      if(!requestMayHaveStarted){pendingManualRun=null;manualRequestTrackingId=null;}
+      throw new Error(data.message||"Não foi possível iniciar a checagem.");
+    }
+    if(data.status!=="started"||typeof data.runId!=="string"){
+      showManualStartPending();
+      schedulePendingManualRetry();
+      return;
+    }
+    manualRequestTrackingId=requestId;
+    pendingManualRun=null;
     manualRunPanel.hidden=false;
     manualRunTitle.textContent="Iniciando checagem";
     manualRunCurrent.textContent=slugs?"Preparando as bibliotecas selecionadas...":"Preparando as bibliotecas monitoradas...";
     setTimeout(updateManualCheck,500);
   }catch(e){
+    if(requestMayHaveStarted){
+      showManualStartPending();
+      schedulePendingManualRetry();
+      return;
+    }
+    pendingManualRun=null;
+    manualRequestTrackingId=null;
     manualCheckButton.disabled=false;
+    manualCustomizeButton.disabled=false;
     manualCheckLabel.textContent="Checar todas";
     updateManualSelectionCount();
     manualRunPanel.hidden=false;
@@ -3663,13 +4177,7 @@ async function startDashboardCheck(slugs){
   }
 }
 
-manualCheckButton.addEventListener("click",function(){startDashboardCheck(null)});
-manualCheckSelectedButton.addEventListener("click",function(){
-  const slugs=selectedManualSlugs();
-  if(!slugs.length)return;
-  manualSelection.open=false;
-  startDashboardCheck(slugs);
-});
+manualCheckButton.addEventListener("click",openAllManualConfirmation);
 
 updateManualCheck();
 
