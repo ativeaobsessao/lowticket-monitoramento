@@ -3017,20 +3017,34 @@ function atualizarGraficoHistorico(){
   histChart.update("none");
 }
 
+function rolarParaGraficoHistorico(){
+  const canvas=document.getElementById(P+"cHist");
+  const painel=canvas?.closest(".panel");
+  if(!painel)return;
+  painel.scrollIntoView({
+    behavior:window.matchMedia("(prefers-reduced-motion: reduce)").matches?"auto":"smooth",
+    block:"center"
+  });
+}
+
 function alternarFixacao(nome){
+  let deveRolar=false;
   if(pinned.includes(nome)){
     pinned=pinned.filter(item=>item!==nome);
     if(focoHist===nome)focoHist=pinned[pinned.length-1]||null;
   }else if(chartSeries.includes(nome)){
-    focoHist=focoHist===nome?null:nome;
+    deveRolar=focoHist!==nome;
+    focoHist=deveRolar?nome:null;
   }else{
     if(pinned.length>=MAX_PINNED)return;
     pinned=[...pinned,nome];
     focoHist=nome;
+    deveRolar=true;
   }
   salvarPinned();
   atualizarSelecaoHistorico();
   atualizarGraficoHistorico();
+  if(deveRolar)rolarParaGraficoHistorico();
 }
 
 const resetHist=document.getElementById(P+"hist-reset");
