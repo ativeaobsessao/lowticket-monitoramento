@@ -650,6 +650,20 @@ let loteStatus = {
   finalizadoEm: null,
 };
 
+let manualCheckStatus = {
+  runId: null,
+  status: "idle",
+  total: 0,
+  concluidos: 0,
+  sucesso: 0,
+  falha: 0,
+  atual: null,
+  resultados: [],
+  iniciadoEm: null,
+  finalizadoEm: null,
+  erro: null,
+};
+
 // Parser de lote — aceita 3 formatos:
 //   Nome | URL
 //   tipo | Nome | URL
@@ -711,7 +725,7 @@ function getCurrentSlot() {
   return 12;
 }
 
-async function processBatch(pages, slot) {
+async function processBatch(pages, slot, onResult = null, onPageStart = null) {
   let browser;
   let context;
   const results = [];
@@ -731,6 +745,7 @@ async function processBatch(pages, slot) {
     
     for (let i = 0; i < pages.length; i++) {
       const p = pages[i];
+      if (onPageStart) onPageStart(p);
 
       // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
       // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
@@ -772,7 +787,9 @@ async function processBatch(pages, slot) {
       // da janela de 8h.
       if (count === null) {
         console.warn(`[BATCH] slug=${p.slug} FALHA na coleta [${statusFinal}] ${erroFinal || "sem detalhe"} — pulado, histórico preservado (sem gravar 0 falso)`);
-        results.push({ slug: p.slug, nome: p.nome, count: null, status: statusFinal, falha: erroFinal || falhaMotivo || "falha desconhecida" });
+        const result = { slug: p.slug, nome: p.nome, count: null, status: statusFinal, falha: erroFinal || falhaMotivo || "falha desconhecida" };
+        results.push(result);
+        if (onResult) onResult(result);
         await new Promise(r => setTimeout(r, 1500));
         continue;
       }
@@ -792,10 +809,22 @@ async function processBatch(pages, slot) {
           );
           console.log(`[LATEST] slug=${p.slug} count=${final} (manual)`);
         }
-        results.push({ slug: p.slug, nome: p.nome, count: final });
+        const result = { slug: p.slug, nome: p.nome, count: final, status: diag.status === "ok_zero" ? "ok_zero" : "ok" };
+        results.push(result);
+        if (onResult) onResult(result);
       } catch (dbErr) {
         console.error(`[BATCH] slug=${p.slug} count=${final} COLETOU MAS FALHOU AO GRAVAR NO BANCO: ${dbErr.message}`);
-        results.push({ slug: p.slug, nome: p.nome, count: null, dbError: true });
+        try {
+          await query(
+            `UPDATE pages SET last_attempt_at = NOW(), last_status = 'falha_gravacao', last_error = $2 WHERE slug = $1`,
+            [p.slug, "Falha ao gravar a contagem no banco de dados."]
+          );
+        } catch (statusErr) {
+          console.error(`[BATCH] slug=${p.slug} também falhou ao atualizar status: ${statusErr.message}`);
+        }
+        const result = { slug: p.slug, nome: p.nome, count: null, status: "falha_gravacao", falha: dbErr.message, dbError: true };
+        results.push(result);
+        if (onResult) onResult(result);
       }
 
       // Delay tático entre páginas
@@ -921,11 +950,13 @@ app.post("/api/salvar", async (req, res) => {
 });
 
 app.get("/api/coletar/:slug", async (req, res) => {
+  if (isRunning) return res.status(409).type("text/plain").send("OCUPADO");
+  isRunning = true;
   const { slug } = req.params;
-  const { rows } = await query("SELECT * FROM pages WHERE slug = $1 LIMIT 1", [slug]);
-  const row = rows[0];
-  if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
   try {
+    const { rows } = await query("SELECT * FROM pages WHERE slug = $1 LIMIT 1", [slug]);
+    const row = rows[0];
+    if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
     const count = await scrapeAdCount(row.url);
     if (count === null) return res.status(502).type("text/plain").send("FALHA");
     res.type("text/plain").send(String(count));
@@ -945,42 +976,155 @@ app.get("/api/coletar/:slug", async (req, res) => {
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
     res.status(500).type("text/plain").send("FALHA");
+  } finally {
+    isRunning = false;
   }
 });
 
-app.get("/api/coletar-tudo", async (_req, res) => {
+function addManualCheckResult(result) {
+  const sucesso = result.count !== null && !result.dbError;
+  manualCheckStatus.resultados.push({
+    slug: result.slug,
+    nome: result.nome,
+    count: sucesso ? result.count : null,
+    status: result.status || (sucesso ? "ok" : "falha_execucao"),
+  });
+  manualCheckStatus = {
+    ...manualCheckStatus,
+    concluidos: manualCheckStatus.concluidos + 1,
+    sucesso: manualCheckStatus.sucesso + (sucesso ? 1 : 0),
+    falha: manualCheckStatus.falha + (sucesso ? 0 : 1),
+    atual: result.nome,
+  };
+}
+
+async function startManualCheck(req, res) {
   if (isRunning) {
     return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
   }
+
+  const hasSelection = req.method === "POST" && req.body && Object.prototype.hasOwnProperty.call(req.body, "slugs");
+  let selectedSlugs = null;
+  if (hasSelection) {
+    const requestedSlugs = req.body.slugs;
+    if (!Array.isArray(requestedSlugs) || requestedSlugs.length === 0 || requestedSlugs.length > 500
+      || requestedSlugs.some((slug) => typeof slug !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug))) {
+      return res.status(400).json({ status: "invalid_selection", message: "Selecione ao menos uma biblioteca válida." });
+    }
+    selectedSlugs = [...new Set(requestedSlugs)];
+  }
+
   isRunning = true;
-  res.json({ status: "started" });
+  let pages;
+  try {
+    const result = selectedSlugs
+      ? await query("SELECT slug, nome, url FROM pages WHERE slug = ANY($1) ORDER BY tipo, nome", [selectedSlugs])
+      : await query("SELECT slug, nome, url FROM pages ORDER BY tipo, nome");
+    pages = result.rows;
+  } catch (err) {
+    isRunning = false;
+    console.error(`[RUN] não foi possível carregar bibliotecas: ${err.message}`);
+    return res.status(500).json({ status: "error", message: "Não foi possível carregar as bibliotecas." });
+  }
+
+  if (selectedSlugs && pages.length !== selectedSlugs.length) {
+    isRunning = false;
+    return res.status(400).json({ status: "invalid_selection", message: "Uma ou mais bibliotecas selecionadas não existem." });
+  }
+
+  const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  manualCheckStatus = {
+    runId,
+    status: "running",
+    escopo: selectedSlugs ? "selecionadas" : "todas",
+    total: 0,
+    concluidos: 0,
+    sucesso: 0,
+    falha: 0,
+    atual: null,
+    resultados: [],
+    iniciadoEm: new Date().toISOString(),
+    finalizadoEm: null,
+    erro: null,
+  };
+  res.status(req.method === "POST" ? 202 : 200).json({ status: "started", runId, escopo: manualCheckStatus.escopo });
 
   (async () => {
     try {
-      const { rows: pages } = await query(`SELECT slug, nome, url FROM pages`);
+      manualCheckStatus = { ...manualCheckStatus, total: pages.length };
       if (pages.length === 0) {
-        console.log("[RUN] coleta-tudo: nenhuma página cadastrada");
+        console.log("[RUN] checagem manual sem bibliotecas selecionadas");
+        manualCheckStatus = { ...manualCheckStatus, status: "completed" };
         return;
       }
 
       const CHUNK_SIZE = 5; // mesmo tamanho de lote usado pelo cron — navegador é reiniciado a cada lote
-      console.log(`[RUN] coleta-tudo manual iniciada — ${pages.length} páginas, em lotes de ${CHUNK_SIZE}`);
+      console.log(`[RUN] checagem manual iniciada — ${pages.length} bibliotecas, escopo=${manualCheckStatus.escopo}, blocos de ${CHUNK_SIZE}`);
 
-      let processadas = 0;
       for (let i = 0; i < pages.length; i += CHUNK_SIZE) {
         const lote = pages.slice(i, i + CHUNK_SIZE);
-        await processBatch(lote, null);
-        processadas += lote.length;
-        console.log(`[RUN] coleta-tudo progresso: ${processadas}/${pages.length}`);
+        const reportados = new Set();
+        let resultadosLote = [];
+        try {
+          resultadosLote = await processBatch(lote, null, (result) => {
+            reportados.add(result.slug);
+            addManualCheckResult(result);
+          }, (page) => {
+            manualCheckStatus = { ...manualCheckStatus, atual: page.nome };
+          });
+        } catch (err) {
+          console.error(`[RUN] falha no bloco ${Math.floor(i / CHUNK_SIZE) + 1}: ${err.message}`);
+        }
+
+        const concluidosNoLote = new Set(resultadosLote.map((result) => result.slug));
+        for (const page of lote) {
+          if (reportados.has(page.slug) || concluidosNoLote.has(page.slug)) continue;
+          const falha = "A execução do bloco foi interrompida antes da coleta.";
+          try {
+            await query(
+              `UPDATE pages SET last_attempt_at = NOW(), last_status = 'falha_execucao', last_error = $2 WHERE slug = $1`,
+              [page.slug, falha]
+            );
+          } catch (err) {
+            console.error(`[RUN] não foi possível registrar falha de slug=${page.slug}: ${err.message}`);
+          }
+          addManualCheckResult({ ...page, count: null, status: "falha_execucao", falha });
+        }
+        console.log(`[RUN] coleta-tudo progresso: ${manualCheckStatus.concluidos}/${pages.length}`);
       }
 
       console.log(`[RUN] coleta-tudo manual finalizada — ${pages.length} páginas`);
+      manualCheckStatus = {
+        ...manualCheckStatus,
+        status: manualCheckStatus.falha > 0 ? "completed_with_errors" : "completed",
+      };
     } catch (e) {
       console.error("[RUN] manual error:", e.message);
+      manualCheckStatus = {
+        ...manualCheckStatus,
+        status: manualCheckStatus.concluidos > 0 ? "completed_with_errors" : "failed",
+        erro: "Falha ao consultar ou processar as bibliotecas. Consulte os logs do serviço.",
+      };
     } finally {
       isRunning = false;
+      manualCheckStatus = {
+        ...manualCheckStatus,
+        atual: null,
+        finalizadoEm: new Date().toISOString(),
+      };
     }
   })();
+}
+
+app.route("/api/coletar-tudo").get(startManualCheck).post(startManualCheck);
+app.get("/api/coletar-tudo/status", (_req, res) => {
+  const emExecucao = manualCheckStatus.status === "running";
+  res.json({
+    ...manualCheckStatus,
+    resultados: emExecucao ? manualCheckStatus.resultados.slice(-15) : manualCheckStatus.resultados,
+    totalResultados: manualCheckStatus.resultados.length,
+    ocupado: isRunning,
+  });
 });
 
 app.get("/api/historico/:slug", async (req, res) => {
@@ -2602,6 +2746,41 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .hdr-live{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text2);background:var(--surface);border:1px solid var(--border);padding:7px 14px;border-radius:8px}
 .hdr-admin-btn{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:6px 14px;border-radius:8px;transition:all .15s;white-space:nowrap}
 .hdr-admin-btn:hover{background:var(--accent);color:#fff}
+.manual-check-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;background:#f5f5f7;color:#17171b;border:0;border-radius:8px;padding:7px 13px;font:600 12px 'Space Grotesk',sans-serif;cursor:pointer;transition:background .15s,opacity .15s;white-space:nowrap}
+.manual-check-btn:hover{background:#fff}
+.manual-check-btn:disabled{opacity:.6;cursor:wait}
+.manual-check-btn:focus-visible{outline:2px solid #fff;outline-offset:3px}
+.manual-selection{margin:0 0 14px}
+.manual-selection summary{display:inline-flex;align-items:center;gap:8px;color:var(--text2);font-size:12px;cursor:pointer;list-style:none}
+.manual-selection summary::-webkit-details-marker{display:none}
+.manual-selection summary:after{content:"⌄";color:var(--muted);font-size:14px;transition:transform .15s}
+.manual-selection[open] summary:after{transform:rotate(180deg)}
+.manual-selection-count{color:var(--muted);font:11px 'Space Mono',monospace}
+.manual-selection-box{max-width:680px;margin-top:10px;padding:14px;background:var(--surface);border:1px solid var(--border);border-radius:10px}
+.manual-selection-search{width:100%;margin-bottom:10px;padding:9px 11px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font:12px 'Space Grotesk',sans-serif;outline:none}
+.manual-selection-search:focus{border-color:var(--accent)}
+.manual-selection-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:2px 12px;max-height:220px;overflow:auto}
+.manual-selection-option{display:flex;align-items:center;gap:8px;min-width:0;padding:7px 5px;color:var(--text2);font-size:12px;cursor:pointer}
+.manual-selection-option input{width:14px;height:14px;flex-shrink:0;accent-color:var(--accent)}
+.manual-selection-option span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.manual-selection-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px;padding-top:10px;border-top:1px solid var(--border)}
+.manual-selection-message{color:var(--muted);font-size:11px}
+.manual-selection-submit{background:transparent;color:var(--text2);border:1px solid var(--border);border-radius:8px;padding:7px 11px;font:600 11px 'Space Grotesk',sans-serif;cursor:pointer}
+.manual-selection-submit:hover:not(:disabled){color:#fff;border-color:var(--text2)}
+.manual-selection-submit:disabled{opacity:.45;cursor:not-allowed}
+.manual-run-panel{margin:0 0 20px;padding:14px 16px;background:rgba(255,255,255,.035);border:1px solid var(--border);border-radius:12px}
+.manual-run-panel[hidden]{display:none}
+.manual-run-head{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px}
+.manual-run-title{font-weight:600;color:var(--text)}
+.manual-run-summary,.manual-run-current{color:var(--muted);font-size:11px;margin-top:4px}
+.manual-run-count{color:var(--text2);font:11px 'Space Mono',monospace;white-space:nowrap}
+.manual-run-track{height:3px;margin-top:12px;background:var(--surface2);border-radius:3px;overflow:hidden}
+.manual-run-track span{display:block;width:0;height:100%;background:var(--accent);transition:width .25s ease}
+.manual-run-results{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px 16px;margin-top:12px;max-height:190px;overflow:auto}
+.manual-run-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.045);font-size:11px}
+.manual-run-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)}
+.manual-run-result{white-space:nowrap;color:var(--up);font-family:'Space Mono',monospace}
+.manual-run-result.is-failed{color:var(--down)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:0 0 8px var(--up)}
 .section-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:0 0 12px 2px;display:flex;align-items:center;gap:8px}
 .scaling-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:26px}
@@ -2709,6 +2888,7 @@ tbody tr:hover td{background:var(--surface2)}
   .hdr{flex-wrap:wrap;gap:8px}
   .hdr-live{margin-left:0;width:100%}
   .hdr-admin-btn{width:100%;justify-content:center;box-sizing:border-box}
+  .manual-check-btn{width:100%;box-sizing:border-box}
   .hdr h1{font-size:15px}
   .hdr-sub{font-size:10px}
   .scale-card-val{font-size:24px}
@@ -2742,11 +2922,39 @@ tbody tr:hover td{background:var(--surface2)}
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
     <div class="hdr-live" style="margin-left:0"><span class="dot"></span><span id="livecount"></span></div>
     <div style="display:flex;gap:8px">
+      <button type="button" class="manual-check-btn" id="manual-check-button" title="Conferir todas as bibliotecas monitoradas">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 1-2.34-5.66L20 7"/></svg>
+        <span id="manual-check-label">Checar todas</span>
+      </button>
       <a href="/admin" class="hdr-admin-btn">⚙️ Ir para Admin</a>
       <a href="/funis" class="hdr-admin-btn">🔀 Ver Mapa de Funis</a>
     </div>
   </div>
 </div>
+
+<section class="manual-run-panel" id="manual-run-panel" hidden role="status" aria-live="polite">
+  <div class="manual-run-head">
+    <div>
+      <div class="manual-run-title" id="manual-run-title">Checagem manual</div>
+      <div class="manual-run-current" id="manual-run-current"></div>
+    </div>
+    <div class="manual-run-count" id="manual-run-count"></div>
+  </div>
+  <div class="manual-run-track" role="progressbar" aria-label="Progresso da checagem" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="manual-run-progress"></span></div>
+  <div class="manual-run-results" id="manual-run-results"></div>
+</section>
+
+<details class="manual-selection" id="manual-selection">
+  <summary>Personalizar checagem <span class="manual-selection-count" id="manual-selection-count">0 selecionadas</span></summary>
+  <div class="manual-selection-box">
+    <input class="manual-selection-search" id="manual-selection-search" type="search" placeholder="Buscar biblioteca pelo nome..." aria-label="Buscar biblioteca pelo nome">
+    <div class="manual-selection-list" id="manual-selection-list" role="group" aria-label="Bibliotecas monitoradas">Carregando bibliotecas...</div>
+    <div class="manual-selection-footer">
+      <span class="manual-selection-message" id="manual-selection-message">Selecione uma ou mais bibliotecas.</span>
+      <button type="button" class="manual-selection-submit" id="manual-check-selected" disabled>Checar selecionadas</button>
+    </div>
+  </div>
+</details>
 
 <div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
 
@@ -3262,6 +3470,208 @@ document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+
 
 render(D_PAG,HD_PAG,"pag_");
 render(D_DOM,HD_DOM,"dom_");
+
+const manualCheckButton=document.getElementById("manual-check-button");
+const manualCheckLabel=document.getElementById("manual-check-label");
+const manualSelection=document.getElementById("manual-selection");
+const manualSelectionList=document.getElementById("manual-selection-list");
+const manualSelectionSearch=document.getElementById("manual-selection-search");
+const manualSelectionCount=document.getElementById("manual-selection-count");
+const manualSelectionMessage=document.getElementById("manual-selection-message");
+const manualCheckSelectedButton=document.getElementById("manual-check-selected");
+const manualRunPanel=document.getElementById("manual-run-panel");
+const manualRunTitle=document.getElementById("manual-run-title");
+const manualRunCurrent=document.getElementById("manual-run-current");
+const manualRunCount=document.getElementById("manual-run-count");
+const manualRunProgress=document.getElementById("manual-run-progress");
+const manualRunTrack=manualRunProgress.parentElement;
+const manualRunResults=document.getElementById("manual-run-results");
+const manualStatusLabels={
+  ok:"Conferida",
+  ok_zero:"0 anúncios",
+  falha_bloqueio:"Bloqueio Meta",
+  falha_timeout:"Timeout/rede",
+  falha_parse:"Contador não lido",
+  falha_url_invalida:"URL inválida",
+  falha_gravacao:"Falha ao salvar",
+  falha_execucao:"Falha na execução",
+};
+let dashboardReloadingRunId=null;
+let manualSelectionLoaded=false;
+
+function selectedManualSlugs(){
+  return Array.from(manualSelectionList.querySelectorAll("input[type=checkbox]:checked"),function(input){return input.value});
+}
+
+function updateManualSelectionCount(){
+  const total=selectedManualSlugs().length;
+  manualSelectionCount.textContent=total+" selecionada"+(total===1?"":"s");
+  manualSelectionMessage.textContent=total?total+" biblioteca"+(total===1?"":"s")+" selecionada"+(total===1?"":"s")+".":"Selecione uma ou mais bibliotecas.";
+  manualCheckSelectedButton.textContent="Checar selecionadas ("+total+")";
+  manualCheckSelectedButton.disabled=total===0||manualCheckButton.disabled;
+}
+
+function renderManualSelection(pages){
+  manualSelectionList.replaceChildren();
+  if(!pages.length){
+    manualSelectionList.textContent="Nenhuma biblioteca cadastrada.";
+    return;
+  }
+  pages.forEach(function(page){
+    const label=document.createElement("label");
+    label.className="manual-selection-option";
+    label.dataset.search=(page.nome+" "+page.tipo).toLowerCase();
+    const checkbox=document.createElement("input");
+    checkbox.type="checkbox";
+    checkbox.value=page.slug;
+    checkbox.setAttribute("aria-label","Selecionar "+page.nome);
+    checkbox.addEventListener("change",updateManualSelectionCount);
+    const name=document.createElement("span");
+    name.textContent=page.nome;
+    label.append(checkbox,name);
+    manualSelectionList.appendChild(label);
+  });
+  updateManualSelectionCount();
+}
+
+async function loadManualSelection(){
+  if(manualSelectionLoaded)return;
+  manualSelectionLoaded=true;
+  try{
+    const response=await fetch("/api/paginas",{cache:"no-store"});
+    if(!response.ok)throw new Error("Não foi possível carregar as bibliotecas.");
+    const pages=await response.json();
+    renderManualSelection(pages);
+  }catch(e){
+    manualSelectionLoaded=false;
+    manualSelectionList.textContent="Falha ao carregar a lista. Abra novamente para tentar.";
+  }
+}
+
+manualSelection.addEventListener("toggle",function(){
+  if(manualSelection.open)loadManualSelection();
+});
+
+manualSelectionSearch.addEventListener("input",function(){
+  const term=manualSelectionSearch.value.trim().toLowerCase();
+  manualSelectionList.querySelectorAll(".manual-selection-option").forEach(function(option){
+    option.hidden=term!==""&&!option.dataset.search.includes(term);
+  });
+});
+
+function renderManualCheck(state){
+  const estaRodando=state.status==="running";
+  const ocupadoSemRelatorio=state.ocupado&&!estaRodando;
+  manualCheckButton.disabled=estaRodando||state.ocupado;
+  manualCheckLabel.textContent=estaRodando?"Conferindo...":"Checar todas";
+  updateManualSelectionCount();
+  if(state.status==="idle"&&!state.ocupado){
+    manualRunPanel.hidden=true;
+    return;
+  }
+  manualRunPanel.hidden=false;
+  if(ocupadoSemRelatorio){
+    manualRunTitle.textContent="Já existe uma coleta em andamento";
+    manualRunCurrent.textContent="Aguarde a execução atual terminar para iniciar outra.";
+    manualRunCount.textContent="";
+    manualRunProgress.style.width="0%";
+    manualRunTrack.setAttribute("aria-valuenow","0");
+    manualRunResults.replaceChildren();
+    return;
+  }
+
+  const progresso=state.total?Math.round((state.concluidos/state.total)*100):0;
+  const finalizado=state.status==="completed"||state.status==="completed_with_errors"||state.status==="failed";
+  manualRunTitle.textContent=state.status==="running"?(state.escopo==="selecionadas"?"Conferindo selecionadas":"Conferindo bibliotecas"):state.status==="completed"?"Checagem concluída":state.status==="failed"?"Não foi possível concluir a checagem":"Checagem concluída com falhas";
+  manualRunCurrent.textContent=state.status==="running"?(state.atual?"Conferindo: "+state.atual:"Preparando coleta..."):(state.erro||"Resultado atualizado na dashboard.");
+  manualRunCount.textContent=state.concluidos+" / "+state.total+" · "+state.sucesso+" ok · "+state.falha+" falhas";
+  manualRunProgress.style.width=progresso+"%";
+  manualRunTrack.setAttribute("aria-valuenow",String(progresso));
+  manualRunResults.replaceChildren();
+  for(const item of state.resultados||[]){
+    const row=document.createElement("div");
+    row.className="manual-run-row";
+    row.title=item.falha||"";
+    const name=document.createElement("span");
+    name.className="manual-run-name";
+    name.textContent=item.nome||item.slug;
+    const result=document.createElement("span");
+    result.className="manual-run-result";
+    const ok=item.count!==null&&item.count!==undefined;
+    result.textContent=ok?Number(item.count).toLocaleString("pt-BR")+" anúncios":(manualStatusLabels[item.status]||"Falhou");
+    if(!ok)result.classList.add("is-failed");
+    row.append(name,result);
+    manualRunResults.appendChild(row);
+  }
+
+  if(finalizado&&state.runId&&dashboardReloadingRunId!==state.runId){
+    try{
+      const refreshKey="lowticket-manual-check-refresh";
+      if(sessionStorage.getItem(refreshKey)!==state.runId){
+        sessionStorage.setItem(refreshKey,state.runId);
+        dashboardReloadingRunId=state.runId;
+        setTimeout(()=>window.location.reload(),700);
+      }
+    }catch(e){}
+  }
+}
+
+async function updateManualCheck(){
+  try{
+    const response=await fetch("/api/coletar-tudo/status",{cache:"no-store"});
+    if(!response.ok)throw new Error("Falha ao consultar status");
+    const state=await response.json();
+    renderManualCheck(state);
+    if(state.status==="running"||state.ocupado)setTimeout(updateManualCheck,1500);
+  }catch(e){
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Não foi possível consultar a checagem";
+    manualRunCurrent.textContent="Atualize a página para tentar novamente.";
+    setTimeout(updateManualCheck,3000);
+  }
+}
+
+async function startDashboardCheck(slugs){
+  manualCheckButton.disabled=true;
+  manualCheckSelectedButton.disabled=true;
+  manualCheckLabel.textContent="Iniciando...";
+  try{
+    const options={method:"POST"};
+    if(slugs){
+      options.headers={"Content-Type":"application/json"};
+      options.body=JSON.stringify({slugs:slugs});
+    }
+    const response=await fetch("/api/coletar-tudo",options);
+    const data=await response.json();
+    if(response.status===409){
+      renderManualCheck({status:"idle",ocupado:true,resultados:[]});
+      setTimeout(updateManualCheck,1800);
+      return;
+    }
+    if(!response.ok)throw new Error(data.message||"Não foi possível iniciar a checagem.");
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Iniciando checagem";
+    manualRunCurrent.textContent=slugs?"Preparando as bibliotecas selecionadas...":"Preparando as bibliotecas monitoradas...";
+    setTimeout(updateManualCheck,500);
+  }catch(e){
+    manualCheckButton.disabled=false;
+    manualCheckLabel.textContent="Checar todas";
+    updateManualSelectionCount();
+    manualRunPanel.hidden=false;
+    manualRunTitle.textContent="Não foi possível iniciar a checagem";
+    manualRunCurrent.textContent=e.message;
+  }
+}
+
+manualCheckButton.addEventListener("click",function(){startDashboardCheck(null)});
+manualCheckSelectedButton.addEventListener("click",function(){
+  const slugs=selectedManualSlugs();
+  if(!slugs.length)return;
+  manualSelection.open=false;
+  startDashboardCheck(slugs);
+});
+
+updateManualCheck();
 
 <\/script>
 </body>
