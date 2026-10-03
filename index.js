@@ -1264,14 +1264,13 @@ app.get("/api/ultima-checagem", async (_req, res) => {
                'at', a.checked_at,
                'relevante', COALESCE(
                  a.checked_at > NOW() - INTERVAL '6 hours'
-                 AND a.status IN ('falha_timeout','falha_bloqueio','falha_parse','falha_url_invalida','falha_gravacao')
-                 AND (a.source LIKE 'cron%' OR a.source LIKE 'manual%'),
+                 AND a.status LIKE 'falha_%',
                  FALSE
                )
              ) AS tentativa
       FROM pages p
       LEFT JOIN LATERAL (
-        SELECT COALESCE(completed_at, started_at) AS checked_at, status, error, source
+        SELECT COALESCE(completed_at, started_at) AS checked_at, status, error
         FROM scrape_attempts
         WHERE slug = p.slug
         ORDER BY started_at DESC, id DESC
@@ -3227,7 +3226,7 @@ app.get("/dashboard", async (_req, res) => {
                  COALESCE(completed_at, started_at) AS checked_at,
                  COALESCE(
                    COALESCE(completed_at, started_at) > NOW() - INTERVAL '6 hours'
-                   AND status IN ('falha_timeout','falha_bloqueio','falha_parse','falha_url_invalida','falha_gravacao'),
+                   AND status LIKE 'falha_%',
                    FALSE
                  ) AS alert_relevant
           FROM scrape_attempts
@@ -3332,13 +3331,12 @@ app.get("/dashboard", async (_req, res) => {
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
     const grupoKeywords = await processarGrupo(allPages.filter(p => p.tipo === "keyword"));
 
-    const safe = (o) => JSON.stringify(o).replace(/</g, '\\u003c').replace(/'/g, "\\u0027").replace(/\\n/g, '\\n');
-    const dados       = safe(grupoPaginas.geral);
-    const histDados   = safe(grupoPaginas.hist);
-    const dadosDom    = safe(grupoDominios.geral);
-    const histDadosDom = safe(grupoDominios.hist);
-    const dadosKey    = safe(grupoKeywords.geral);
-    const histDadosKey = safe(grupoKeywords.hist);
+    const dados       = JSON.stringify(grupoPaginas.geral);
+    const histDados   = JSON.stringify(grupoPaginas.hist);
+    const dadosDom    = JSON.stringify(grupoDominios.geral);
+    const histDadosDom = JSON.stringify(grupoDominios.hist);
+    const dadosKey    = JSON.stringify(grupoKeywords.geral);
+    const histDadosKey = JSON.stringify(grupoKeywords.hist);
     const IG_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor"/></svg>';
 
     // "📢 Mapeamento ADS": lê todo nó tipo='ads', conectado ou não, agrupado por página.
@@ -3550,32 +3548,10 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .hist-pin-btn:hover{border-color:var(--accent);color:var(--text)}
 .hist-pin-btn.is-pinned,.hist-pin-btn.is-focused{border-color:var(--accent);background:rgba(124,111,255,.12);color:var(--accent)}
 .hist-pin-btn:disabled{cursor:not-allowed;opacity:.5}
-.tbl-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}
-.tbl-panel table{width:100%;min-width:1250px;table-layout:fixed;border-collapse:collapse;font-size:13px}
+.tbl-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{background:var(--surface2);color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:11px 16px;text-align:left;font-weight:600}
 td{padding:11px 16px;border-top:1px solid var(--border);color:var(--text2);white-space:nowrap}
-th.participacao-header,td.participacao-cell{width:140px;min-width:140px;max-width:140px;overflow:hidden;box-sizing:border-box}
-.participacao-wrapper{display:flex;align-items:center;gap:8px;width:100%;max-width:100%;overflow:hidden;box-sizing:border-box}
-.participacao-wrapper .scalebar-bg{width:70px;min-width:70px;max-width:70px;height:5px;background:var(--border);border-radius:3px;display:inline-block;overflow:hidden;flex-shrink:0;margin:0;vertical-align:middle}
-.participacao-wrapper .scalebar{height:5px;display:block;border-radius:0}
-.score-cell-td{overflow:hidden}
-.score-cell{display:flex;flex-direction:column;gap:3px;min-width:115px;cursor:help}
-.score-main{display:flex;align-items:center;gap:6px}
-.score-number{font-family:'Space Mono',monospace;font-weight:800;font-size:14px;padding:4px 8px;border-radius:7px;min-width:36px;text-align:center}
-.score-icon{font-size:14px}
-.score-fase{display:flex;align-items:center;gap:4px;font-size:10px;white-space:nowrap}
-.fase-label{font-weight:700;text-transform:uppercase}
-.fase-trend{font-family:'Space Mono',monospace}
-.score-escalando .score-number{background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.35)}
-.score-declinio .score-number{background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.35)}
-.score-declinio .fase-trend{color:#fbbf24}
-.score-testando .score-number{background:rgba(96,165,250,.15);color:#60a5fa;border:1px solid rgba(96,165,250,.35)}
-.score-testando .fase-trend{color:#60a5fa}
-.score-queda .score-number,.score-inativo .score-number{background:rgba(251,113,133,.13);color:#fb7185;border:1px solid rgba(251,113,133,.3)}
-.score-queda .fase-trend,.score-inativo .fase-trend{color:#fb7185}
-.score-estavel .score-number,.score-freando .score-number{background:rgba(136,136,170,.12);color:#9999b8;border:1px solid rgba(136,136,170,.28)}
-.score-escalando .fase-trend{color:#34d399}
 tbody tr:hover td{background:var(--surface2)}
 .t-name{font-weight:600;color:#fff;white-space:normal}
 .t-name-main{display:block;font-weight:600;color:#fff;margin-bottom:4px}
@@ -3635,6 +3611,13 @@ tbody tr:hover td{background:var(--surface2)}
   .rosca-wrap{flex-direction:column;align-items:flex-start}
   .rosca-canvas{width:120px;height:120px}
   .hist-box{height:220px}
+  .tbl-panel table thead{display:none}
+  .tbl-panel table tbody tr{display:block;background:var(--surface2);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;padding:12px 14px}
+  .tbl-panel table tbody td{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-top:none;white-space:normal;font-size:12px}
+  .tbl-panel table tbody td::before{content:attr(data-label);font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-right:10px;flex-shrink:0}
+  .tbl-panel table tbody td.t-name{font-size:14px;font-weight:700;color:#fff;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px}
+  .tbl-panel table tbody td.t-name::before{display:none}
+  .scalebar-bg{width:50px}
 }
 @media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
 .search-wrap{position:relative;margin-bottom:14px}
@@ -3776,7 +3759,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Bibliotecas</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th id="pag_th_score" tabindex="0" role="button" aria-sort="descending" title="Clique para ordenar pelo score" style="cursor:pointer">SCORE ↕</th><th class="participacao-header">Participação</th><th id="pag_th_janela">3D</th><th>Instagram</th>
+      <th>Δ Total</th><th>Tendência</th><th id="pag_th_score" tabindex="0" role="button" aria-sort="descending" title="Clique para ordenar pelo score" style="cursor:pointer">SCORE ↕</th><th>Participação</th><th id="pag_th_janela">3D</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
   </table>
@@ -3815,7 +3798,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Domínios</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th class="participacao-header">Participação</th><th>3 dias</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
   </table>
@@ -3853,7 +3836,7 @@ tbody tr:hover td{background:var(--surface2)}
     <table>
       <thead><tr>
         <th>#</th><th>Palavras-chave</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-        <th>Δ Total</th><th>Tendência</th><th class="participacao-header">Participação</th><th>3 dias</th>
+        <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
       </tr></thead>
       <tbody id="key_tbody"></tbody>
     </table>
@@ -4021,7 +4004,7 @@ function shiftDateKey(dateKey,days){
 }
 function computeScoreAndFase(pagName){
   const at=ultima[pagName]?.ads;
-  if(at===0||at===null||at===undefined)return{score:0,fase:"💀 INATIVO",label:"Morto",velocidadeAtual:0,aceleracao:0,veredito:"Morto"};
+  if(at===0||at===null||at===undefined)return{score:0,fase:"💀 INATIVO",label:"Morto",velocidadeAtual:0,aceleracao:0};
 
   const serieCompleta=datas
     .map(dk=>({data:dk,valor:pags[pagName]?.[dk]?med(pags[pagName][dk]):null}))
@@ -4059,9 +4042,9 @@ function computeScoreAndFase(pagName){
   if(velocidadeAtual>0.5)score+=30;
   else if(velocidadeAtual>0.1)score+=20;
   else if(velocidadeAtual>0)score+=8;
-  if(velocidadeAtual>0.1&&aceleracao>=-0.05)score+=20;
-  else if(velocidadeAtual>0.1&&aceleracao< -0.05)score+=5;
-  else if(velocidadeAtual< -0.1&&aceleracao>0)score+=8;
+  if(aceleracao>=0&&velocidadeAtual>0)score+=20;
+  else if(aceleracao<0&&velocidadeAtual>0)score+=5;
+  else if(aceleracao>0&&velocidadeAtual<0)score+=8;
   if(vn>=10&&vn<=150)score+=15;
   else if(vn>150&&vn<=400)score+=8;
   score=Math.max(0,Math.min(100,Math.round(score)));
@@ -4072,41 +4055,9 @@ function computeScoreAndFase(pagName){
   else if(velocidadeAtual>0.1&&aceleracao< -0.05)fase="⚠️ EM DECLÍNIO";
   else if(Math.abs(velocidadeAtual)<=0.1)fase="➖ ESTÁVEL";
   else if(velocidadeAtual< -0.1&&aceleracao<=0)fase="📉 EM QUEDA";
-  else if(velocidadeAtual< -0.1&&aceleracao>0)fase="🔄 FREANDO QUEDA";
+  else if(velocidadeAtual< -0.1&&aceleracao>0)fase="🔄 QUEDA FREANDO";
   else fase="➖ ESTÁVEL";
-  const veredito=score>=85&&fase.includes("🚀")?"✅ Vale modelar"
-    :fase.includes("⚠️")?"⚠️ Cuidado - em declínio"
-    :fase.includes("🧪")?"👀 Testando - entrar barato"
-    :"❌ Ignorar";
-  return{score,fase,label:fase,velocidadeAtual,aceleracao,veredito};
-}
-function scoreCellContent(result,pagName){
-  const fase=result.fase||"➖ ESTÁVEL";
-  const faseClass=fase.includes("🚀")?"score-escalando"
-    :fase.includes("DECLÍNIO")?"score-declinio"
-    :fase.includes("TESTANDO")?"score-testando"
-    :fase.includes("QUEDA")?"score-queda"
-    :fase.includes("INATIVO")?"score-inativo"
-    :fase.includes("FREANDO")?"score-freando"
-    :"score-estavel";
-  const faseEmoji=fase.split(/\s+/)[0];
-  const labelSemEmoji=fase.replace(/^\S+\s*/,"");
-  const stats=computeWindowStats(pagName,pagWindow,pagWindowCustom?pagCustom:null);
-  const pctJanela=Math.round(Number(stats.pct)||0);
-  const trendIcon=fase.includes("DECLÍNIO")?"↘"
-    :fase.includes("ESCALANDO")?"↗"
-    :fase.includes("FREANDO")?"↗"
-    :pctJanela>0?"↗":pctJanela<0?"↘":"→";
-  const trendLabel=fase.includes("DECLÍNIO")
-    ?"Desacelerando"
-    :(pctJanela>0?"+":"")+pctJanela+"%";
-  const title="Velocidade: "+result.velocidadeAtual.toFixed(2)+" ads/dia na janela "+windowLabel()
-    +" | Aceleração: "+result.aceleracao.toFixed(2)+" | Variação: "+(pctJanela>0?"+":"")+pctJanela+"%"
-    +" | "+result.veredito;
-  return'<div class="score-cell '+faseClass+'" title="'+escapeAttr(title)+'">'
-    +'<div class="score-main"><span class="score-number">'+result.score+'</span><span class="score-icon">'+faseEmoji+'</span></div>'
-    +'<div class="score-fase"><span class="fase-label">'+labelSemEmoji+'</span><span class="fase-trend">'+trendIcon+' '+trendLabel+'</span></div>'
-    +'</div>';
+  return{score,fase,label:fase,velocidadeAtual,aceleracao};
 }
 let scoreSortDirection=-1;
 const scoreByName=new Map();
@@ -4201,7 +4152,9 @@ function updateScoreCellsAndSort(){
     scoreByName.set(pagName,result);
     const cell=row.querySelector("[data-role='pag-score']");
     if(cell){
-      cell.innerHTML=scoreCellContent(result,pagName);
+      const badgeClass=result.score>=85?"b-hot":result.score>=60?"b-up":"b-flat";
+      const title="Velocidade: "+result.velocidadeAtual.toFixed(2)+"/dia | Aceleração: "+result.aceleracao.toFixed(2);
+      cell.innerHTML='<span class="badge '+badgeClass+'" title="'+escapeAttr(title)+'">'+result.score+' '+result.fase+'</span>';
       cell.dataset.scoreValue=String(result.score);
     }
   }
@@ -4442,17 +4395,19 @@ porAds.forEach((pag,idx)=>{
   const checkAt=ultima[pag]?.ultimaColeta;
   const tentativa=ultima[pag]?.tentativa;
   const checkStatus=tentativa?.status;
-  const checkLabels={falha_timeout:"timeout",falha_bloqueio:"bloqueio Meta",falha_parse:"não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar"};
-  const checkStatusHtml=tentativa?.relevante&&checkLabels[checkStatus]
-    ?'<div style="color:#fb7185;font-size:10px" title="'+escapeAttr(tentativa.error||"")+'">'+checkLabels[checkStatus]+'</div>'
+  const checkLabels={em_andamento:"em andamento",falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
+  const checkStatusHtml=tentativa?.relevante&&checkStatus
+    ?'<div style="color:#fb7185;font-size:10px" title="'+escapeAttr(tentativa.error||"")+'">'+(checkLabels[checkStatus]||"falhou")+'</div>'
     :'';
   tr.dataset.search=(pag+" "+(ultima[pag]?.url||"")+" "+(m.geo||"")+" "+(m.nicho||"")).toLowerCase();
   const trendCell=P==="pag_"
     ?'<td data-label="Tendência" data-role="pag-window-trend">'+windowTrendHtml(pagWindowStats)+'</td>'
     :'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>';
   const scoreData=P==="pag_"?scoreByName.get(pag):null;
+  const scoreBadgeClass=scoreData?(scoreData.score>=85?"b-hot":scoreData.score>=60?"b-up":"b-flat"):"";
+  const scoreTitle=scoreData?"Velocidade: "+scoreData.velocidadeAtual.toFixed(2)+"/dia | Aceleração: "+scoreData.aceleracao.toFixed(2):"";
   const scoreCell=scoreData
-    ?'<td class="score-cell-td" data-label="SCORE" data-role="pag-score" data-score-value="'+scoreData.score+'">'+scoreCellContent(scoreData,pag)+'</td>'
+    ?'<td data-label="SCORE" data-role="pag-score" data-score-value="'+scoreData.score+'"><span class="badge '+scoreBadgeClass+'" title="'+escapeAttr(scoreTitle)+'">'+scoreData.score+' '+scoreData.fase+'</span></td>'
     :'';
   const windowCell=P==="pag_"
     ?'<td class="spark3" data-label="'+windowLabel()+'" data-role="pag-window-value">'+windowValueHtml(pagWindowStats)+'</td>'
@@ -4471,7 +4426,7 @@ porAds.forEach((pag,idx)=>{
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +trendCell
     +scoreCell
-    +'<td class="participacao-cell" data-label="Participação"><div class="participacao-wrapper"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="pct" style="font-size:11px;font-family:\'Space Mono\',monospace;color:var(--muted);flex-shrink:0">'+partPct+'%</span></div></td>'
+    +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
     +windowCell
     +instagramCell;
   const pinButton=document.createElement("button");
@@ -4595,13 +4550,12 @@ function filtrarTabela(P){
   if(msg)msg.style.display=visiveis===0?"block":"none";
 }
 
-const D_DOM=JSON.parse('__DADOS_DOM__');
-const HD_DOM=JSON.parse('__HIST_DOM__');
-const D_KEY=JSON.parse('__DADOS_KEY__');
-const HD_KEY=JSON.parse('__HIST_KEY__');
-const D_PAG=JSON.parse('__DADOS_PLACEHOLDER__');
-const HD_PAG=JSON.parse('__HIST_PLACEHOLDER__');
-
+const D_DOM=__DADOS_DOM__;
+const HD_DOM=__HIST_DOM__;
+const D_KEY=__DADOS_KEY__;
+const HD_KEY=__HIST_KEY__;
+const D_PAG=__DADOS_PLACEHOLDER__;
+const HD_PAG=__HIST_PLACEHOLDER__;
 
 const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length+Object.keys(D_KEY.pags).length;
 document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_KEY.pags).length+" palavras-chave · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
@@ -5027,7 +4981,7 @@ async function refreshLastChecks(){
     if(!response.ok)throw new Error("Falha ao consultar últimas checagens");
     const checks=await response.json();
     const cells=new Map([...document.querySelectorAll(".last-check-cell")].map(cell=>[cell.dataset.slug,cell]));
-    const labels={falha_timeout:"timeout",falha_bloqueio:"bloqueio Meta",falha_parse:"não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar"};
+    const labels={falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
     for(const check of checks){
       const cell=cells.get(check.slug);
       if(!cell)continue;
@@ -5037,11 +4991,11 @@ async function refreshLastChecks(){
       }else{
         cell.append(document.createTextNode("—"));
       }
-      if(check.tentativa?.relevante&&labels[check.tentativa?.status]){
+      if(check.tentativa?.relevante&&check.tentativa?.status){
         const state=document.createElement("div");
         state.style.color="#fb7185";
         state.style.fontSize="10px";
-        state.textContent=labels[check.tentativa.status];
+        state.textContent=labels[check.tentativa.status]||"falhou";
         if(check.tentativa.error)state.title=check.tentativa.error;
         cell.appendChild(state);
       }
