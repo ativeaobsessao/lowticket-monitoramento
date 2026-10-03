@@ -29,17 +29,31 @@ test("last-check date uses only successful collection and failures are separate 
   const dashboardScript = source.slice(inlineScriptStart, inlineScriptEnd);
   const renderStart = dashboardScript.indexOf("function render(D,HD,P){");
   const renderAndRefresh = dashboardScript.slice(renderStart);
+  const tableAlertStart = renderAndRefresh.indexOf("const checkLabels=");
+  const tableAlertEnd = renderAndRefresh.indexOf("tr.dataset.search=", tableAlertStart);
+  const tableAlert = renderAndRefresh.slice(tableAlertStart, tableAlertEnd);
+  const refreshStart = renderAndRefresh.indexOf("async function refreshLastChecks(){");
+  const refreshEnd = renderAndRefresh.indexOf("\nasync function updateManualCheck(){", refreshStart);
+  const refreshLastChecks = renderAndRefresh.slice(refreshStart, refreshEnd);
 
   assert.match(route, /l\.collected_at AS ultima_coleta_ok/);
   assert.match(route, /jsonb_build_object\([\s\S]*'status', a\.status,[\s\S]*'error', a\.error,[\s\S]*'at', a\.checked_at,[\s\S]*'relevante'/);
   assert.match(route, /a\.checked_at > NOW\(\) - INTERVAL '6 hours'/);
-  assert.match(route, /a\.status LIKE 'falha_%'/);
+  assert.match(route, /a\.status IN \('falha_timeout','falha_bloqueio','falha_parse','falha_url_invalida','falha_gravacao'\)/);
+  assert.match(route, /a\.source LIKE 'cron%' OR a\.source LIKE 'manual%'/);
+  assert.match(route, /status, error, source/);
+  assert.doesNotMatch(route, /falha_execucao|em_andamento/);
   assert.doesNotMatch(route, /CASE\s+WHEN[\s\S]*last_attempt_at/);
 
   assert.match(renderAndRefresh, /const checkAt=ultima\[pag\]\?\.ultimaColeta/);
   assert.match(renderAndRefresh, /tentativa\?\.relevante/);
+  assert.match(tableAlert, /checkLabels=\{falha_timeout:"timeout",falha_bloqueio:"bloqueio Meta",falha_parse:"não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar"\}/);
+  assert.doesNotMatch(tableAlert, /falha_execucao|em_andamento|execução interrompida/);
+  assert.match(refreshLastChecks, /const labels=\{falha_timeout:"timeout",falha_bloqueio:"bloqueio Meta",falha_parse:"não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar"\}/);
+  assert.doesNotMatch(refreshLastChecks, /falha_execucao|em_andamento|execução interrompida/);
   assert.match(renderAndRefresh, /check\.ultima_coleta_ok/);
-  assert.match(renderAndRefresh, /check\.tentativa\?\.relevante&&check\.tentativa\?\.status/);
+  assert.match(renderAndRefresh, /check\.tentativa\?\.relevante&&labels\[check\.tentativa\?\.status\]/);
+  assert.match(renderAndRefresh, /labels\[check\.tentativa\?\.status\]/);
   assert.doesNotMatch(renderAndRefresh, /check\.checked_at|ultima\[pag\]\?\.tentativa\|\|ultima\[pag\]\?\.ultimaColeta/);
 });
 
@@ -128,15 +142,33 @@ test("library scores use the selected window and never add score columns to othe
 
   assert.equal(ester.score, 100);
   assert.equal(ester.fase, "🚀 ESCALANDO");
+  assert.equal(ester.veredito, "✅ Vale modelar");
   assert.equal(meuFluxo.score, 43);
   assert.equal(meuFluxo.fase, "⚠️ EM DECLÍNIO");
+  assert.equal(meuFluxo.veredito, "⚠️ Cuidado - em declínio");
   assert.equal(inactive.score, 0);
   assert.equal(inactive.fase, "💀 INATIVO");
+  assert.equal(inactive.veredito, "Morto");
   assert.match(source, /id="pag_th_score"/);
+  assert.match(script, /function scoreCellContent\(result,pagName\)/);
+  assert.match(script, /Desacelerando/);
+  assert.match(script, /score-escalando/);
+  assert.match(script, /score-declinio/);
   assert.match(script, /const porAds=\[\.\.\.LP\]\.sort\(\(a,b\)=>P==="pag_"/);
   assert.match(script, /let scoreSortDirection=-1/);
   assert.match(script, /return \(scoreA-scoreB\)\*scoreSortDirection/);
   assert.doesNotMatch(script.slice(script.indexOf('id="dom_tbody"'), script.indexOf('id="key_tbody"')), /data-role="pag-score"/);
+});
+
+test("summary table participation stays clipped inside a fixed-width scrolling table", async () => {
+  const source = await readFile(new URL("../index.js", import.meta.url), "utf8");
+  assert.match(source, /\.tbl-panel\{[^}]*overflow-x:auto/);
+  assert.match(source, /\.tbl-panel table\{[^}]*min-width:1250px;table-layout:fixed/);
+  assert.match(source, /th\.participacao-header,td\.participacao-cell\{width:140px;min-width:140px;max-width:140px;overflow:hidden/);
+  assert.match(source, /\.participacao-wrapper \.scalebar-bg\{width:70px;min-width:70px;max-width:70px[^}]*overflow:hidden/);
+  assert.match(source, /class="participacao-cell" data-label="Participação"><div class="participacao-wrapper">/);
+  assert.match(source, /class="pct" style="[^"]*flex-shrink:0"/);
+  assert.doesNotMatch(source, /\.tbl-panel table thead\{display:none\}/);
 });
 
 test("dashboard includes a separate keyword monitoring section and slot history", async () => {
