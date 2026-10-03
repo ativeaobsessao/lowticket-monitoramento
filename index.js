@@ -1565,8 +1565,15 @@ function addManualCheckResult(result) {
   };
   const results = [...manualCheckStatus.resultados];
   const previousIndex = results.findIndex((item) => item.slug === result.slug);
-  if (previousIndex === -1) results.push(resultado);
-  else results[previousIndex] = resultado;
+  const jaDeuCertoAntes = previousIndex !== -1 && results[previousIndex].count !== null;
+
+  if (previousIndex === -1) {
+    results.push(resultado);
+  } else if (jaDeuCertoAntes && !sucesso) {
+    // Já deu certo antes, não sobrescreve com falha - mantém sucesso
+  } else {
+    results[previousIndex] = resultado;
+  }
   const sucessoCount = results.filter((item) => item.count !== null).length;
   manualCheckStatus = {
     ...manualCheckStatus,
@@ -4017,13 +4024,13 @@ function computeScoreAndFase(pagName){
   score=Math.max(0,Math.min(100,Math.round(score)));
 
   let fase;
-  if(serieCompleta.length<=4&&at>0&&at<=20)fase="🧪 TESTANDO";
-  else if(velocidadeAtual>0.1&&aceleracao>=-0.05)fase="🚀 ESCALANDO";
-  else if(velocidadeAtual>0.1&&aceleracao< -0.05)fase="⚠️ EM DECLÍNIO";
-  else if(Math.abs(velocidadeAtual)<=0.1)fase="➖ ESTÁVEL";
-  else if(velocidadeAtual< -0.1&&aceleracao<=0)fase="📉 EM QUEDA";
-  else if(velocidadeAtual< -0.1&&aceleracao>0)fase="🔄 QUEDA FREANDO";
-  else fase="➖ ESTÁVEL";
+  if (serieCompleta.length <= 4 && at > 0 && at <= 20) fase = "🧪 TESTANDO";
+  else if (velocidadeAtual > 0.1 && aceleracao >= -0.05) fase = "🚀 ESCALANDO SUBINDO";
+  else if (velocidadeAtual > 0.1 && aceleracao < -0.05) fase = "⚠ ESCALANDO EM DECLÍNIO";
+  else if (Math.abs(velocidadeAtual) <= 0.1) fase = "➖ ESTÁVEL";
+  else if (velocidadeAtual < -0.1 && aceleracao <= 0) fase = "📉 EM QUEDA";
+  else if (velocidadeAtual < -0.1 && aceleracao > 0) fase = "🔄 QUEDA FREANDO";
+  else fase = "➖ ESTÁVEL";
   return{score,fase,label:fase,velocidadeAtual,aceleracao};
 }
 let scoreSortDirection=-1;
