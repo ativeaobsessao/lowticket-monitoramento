@@ -3227,7 +3227,7 @@ app.get("/dashboard", async (_req, res) => {
                  COALESCE(completed_at, started_at) AS checked_at,
                  COALESCE(
                    COALESCE(completed_at, started_at) > NOW() - INTERVAL '6 hours'
-                   AND status LIKE 'falha_%',
+                   AND status IN ('falha_timeout','falha_bloqueio','falha_parse','falha_url_invalida','falha_gravacao'),
                    FALSE
                  ) AS alert_relevant
           FROM scrape_attempts
