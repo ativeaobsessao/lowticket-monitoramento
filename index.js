@@ -1258,21 +1258,25 @@ app.get("/api/ultima-checagem", async (_req, res) => {
     const { rows } = await query(`
       SELECT p.slug,
              l.collected_at AS ultima_coleta_ok,
-             jsonb_build_object(
-               'status', a.status,
-               'error', a.error,
-               'at', a.checked_at,
-               'relevante', COALESCE(
-                 a.checked_at > NOW() - INTERVAL '6 hours'
-                 AND a.status LIKE 'falha_%',
-                 FALSE
+             CASE
+               WHEN a.checked_at IS NULL THEN NULL
+               ELSE jsonb_build_object(
+                 'status', a.status,
+                 'error', a.error,
+                 'at', a.checked_at,
+                 'relevante', COALESCE(
+                   a.checked_at > NOW() - INTERVAL '6 hours'
+                   AND a.status IN ('falha_timeout','falha_bloqueio','falha_parse','falha_url_invalida','falha_gravacao'),
+                   FALSE
+                 )
                )
-             ) AS tentativa
+             END AS tentativa
       FROM pages p
       LEFT JOIN LATERAL (
-        SELECT COALESCE(completed_at, started_at) AS checked_at, status, error
+        SELECT COALESCE(completed_at, started_at) AS checked_at, status, error, source
         FROM scrape_attempts
         WHERE slug = p.slug
+          AND source IN ('cron','cron_dominio','cron_keyword','manual_lote','manual_individual')
         ORDER BY started_at DESC, id DESC
         LIMIT 1
       ) a ON TRUE
@@ -1779,7 +1783,6 @@ app.get("/api/paginas", async (_req, res) => {
   const { rows } = await query("SELECT slug, nome, url, tipo, keyword_key, instagram_url, geo, nicho, funil FROM pages");
   res.set("Cache-Control", "no-store").json(rows);
 });
-
 // ─── Admin ───────────────────────────────────────────────────────────────────
 
 app.get("/admin", async (_req, res) => {
@@ -1787,7 +1790,6 @@ app.get("/admin", async (_req, res) => {
     "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil, created_at FROM pages ORDER BY tipo, created_at DESC"
   );
 
-  // JSON de cada item, embutido no atributo data-item, usado pelo JS para preencher o formulário ao clicar em Editar
   function escAttr(str) {
     return String(str ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
@@ -2148,14 +2150,12 @@ function confirmarRemoverAdminFinal(){
 });
 
 app.post("/admin/salvar", async (req, res) => {
-    const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
+  const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
   if (!nome || !urlRaw) return res.redirect("/admin?erro=campos-obrigatorios");
   const tipoFinal = normalizeMonitoringType(tipo) || "pagina";
   const url = resolveMetaUrl(urlRaw, tipoFinal);
   if (!url) return res.redirect("/admin?erro=url-invalida");
 
-  // Modo edição: atualiza o registro existente pelo slug original — o slug NUNCA muda,
-  // mesmo que o nome de exibição mude, para preservar o vínculo com scrape_history/scrape_latest.
   if (original_slug && original_slug.trim()) {
     try {
       const keywordKey = tipoFinal === "keyword" ? normalizeKeywordIdentity(nome) : null;
@@ -2175,7 +2175,6 @@ app.post("/admin/salvar", async (req, res) => {
     }
   }
 
-  // Modo cadastro (novo item)
   if (!toSlug(nome)) return res.redirect("/admin?erro=nome-invalido");
   try {
     const record = await saveMonitoringRecord({
@@ -2234,9 +2233,6 @@ const TIPO_INFO = {
 };
 const TIPOS_ORDEM = ["ads", "advertorial", "presell", "tsl", "vsl", "quiz", "whatsapp", "checkout"];
 
-// Computa todos os caminhos (raiz → folha) de um grafo de nós/conexões.
-// Raiz = nó sem conexão de entrada. Folha = nó sem conexão de saída.
-// Guarda contra ciclos interrompendo o caminho se o nó já apareceu nele.
 function computarCaminhos(nodes, edges) {
   const nodesById = {};
   nodes.forEach(n => { nodesById[n.id] = n; });
@@ -2415,7 +2411,7 @@ function renderCaminho(funilItem, idx = 0, isEditMode = false, explicitSlug = ""
   }
 
   const slug = explicitSlug || allNodes[0]?.slug || "";
-  const label = allNodes.map(n => n.rotulo).join(' \u2192 ');
+  const label = allNodes.map(n => n.rotulo).join(' → ');
   const levelsJson = JSON.stringify(levels.map(lvl => lvl.map(n => n.id)));
   const allIdsJson = JSON.stringify(allNodes.map(n => n.id));
 
@@ -2432,17 +2428,16 @@ function renderCaminho(funilItem, idx = 0, isEditMode = false, explicitSlug = ""
       ${treeHtml}
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0">
-      <button type="button" class="btn-edit-sm" onclick='editarFunil(${levelsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
+      <button type="button" class="btn-edit-sm" onclick='editarFunil(${levelsJson})' title="Editar este funil no construtor">✏️ Editar</button>
       <form id="form-rem-caminho-${idx}" method="POST" action="/admin/funis/remover-caminho" style="display:none">
         <input type="hidden" name="slug" value="${slug}">
         <input type="hidden" name="funil_node_ids" value='${allIdsJson}'>
       </form>
-      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir funil mapeado', '${label.replace(/'/g, "\\'")}')">\u2715 Excluir</button>
+      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir funil mapeado', '${label.replace(/'/g, "\\'")}')">✕ Excluir</button>
     </div>
   </div>`;
 }
 
-// Página de gerenciamento de nós/conexões de um player
 app.get("/admin/funis/:slug", async (req, res) => {
   const { slug } = req.params;
   const { rows: pages } = await query("SELECT nome, url FROM pages WHERE slug=$1 LIMIT 1", [slug]);
@@ -2477,7 +2472,7 @@ app.get("/admin/funis/:slug", async (req, res) => {
   const listaEdges = edges.length ? edges.map(e => {
     const de = nodesById[e.from_node_id], para = nodesById[e.to_node_id];
     if (!de || !para) return "";
-    const label = de.rotulo + ' \u2192 ' + para.rotulo;
+    const label = de.rotulo + ' → ' + para.rotulo;
     return `<div class="edge-row">
       ${renderChip(de)}<span class="chip-arrow">→</span>${renderChip(para)}
       <form id="form-rem-${e.id}" method="POST" action="/admin/funis/remover-edge" style="display:none">
@@ -2574,7 +2569,6 @@ input::placeholder{color:var(--muted)}
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
 .msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
 .divider{border:none;border-top:1px solid var(--border);margin:14px 0}
-/* Modal Apple-style */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;z-index:9999;opacity:0;pointer-events:none;transition:opacity .2s ease}
 .modal-overlay.open{opacity:1;pointer-events:all}
 .modal-card{background:#1c1c2e;border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:30px 28px 24px;max-width:340px;width:calc(100% - 40px);box-shadow:0 40px 100px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.06);transform:scale(.92) translateY(12px);transition:transform .28s cubic-bezier(.34,1.4,.64,1),opacity .22s ease;opacity:0;text-align:center}
@@ -2591,7 +2585,6 @@ input::placeholder{color:var(--muted)}
 </style>
 </head>
 <body>
-<!-- Modal Apple-style universal -->
 <div class="modal-overlay" id="modal-remover-apple" onclick="fecharModalAppleOverlay(event)">
   <div class="modal-card">
     <div class="modal-icon">🗑️</div>
@@ -2686,7 +2679,7 @@ function adicionarElo(val){
   var addBtn=document.getElementById('btn-chain-add');
   var arrow=document.createElement('div');
   arrow.className='chain-arrow';
-  arrow.textContent='\u2192';
+  arrow.textContent='→';
   var elo=document.createElement('div');
   elo.className='chain-elo';
   elo.id='chain-elo-'+_chainCount;
@@ -2708,7 +2701,7 @@ function adicionarElo(val){
   var remBtn=document.createElement('button');
   remBtn.type='button';
   remBtn.className='btn-chain-rem';
-  remBtn.textContent='\u2715';
+  remBtn.textContent='✕';
   remBtn.title='Remover esta etapa';
   remBtn.onclick=function(){arrow.remove();elo.remove();renumerarCadeia();};
   elo.appendChild(lbl);
@@ -2730,7 +2723,7 @@ function bifurcarElo(btnEl){
   rm.type='button';
   rm.className='btn-chain-rem';
   rm.style.padding='2px 6px';
-  rm.textContent='\u2715';
+  rm.textContent='✕';
   rm.onclick=function(){row.remove();};
   row.appendChild(sel);
   row.appendChild(rm);
@@ -2751,7 +2744,7 @@ function editarFunil(levels){
     if(idx > 0){
       var arrow=document.createElement('div');
       arrow.className='chain-arrow';
-      arrow.textContent='\u2192';
+      arrow.textContent='→';
       builder.appendChild(arrow);
     }
     _chainCount++;
@@ -2777,7 +2770,7 @@ function editarFunil(levels){
         rm.type='button';
         rm.className='btn-chain-rem';
         rm.style.padding='2px 6px';
-        rm.textContent='\u2715';
+        rm.textContent='✕';
         rm.onclick=function(){row.remove();};
         row.appendChild(sel);
         row.appendChild(rm);
@@ -2799,7 +2792,7 @@ function editarFunil(levels){
       var remEloBtn=document.createElement('button');
       remEloBtn.type='button';
       remEloBtn.className='btn-chain-rem';
-      remEloBtn.textContent='\u2715';
+      remEloBtn.textContent='✕';
       remEloBtn.title='Remover esta etapa';
       remEloBtn.onclick=function(){elo.previousSibling?.remove();elo.remove();renumerarCadeia();};
       elo.appendChild(remEloBtn);
@@ -2828,7 +2821,6 @@ function editarFunil(levels){
 }
 function editarCaminho(ids){ editarFunil(ids); }
 
-/* ── Modal Apple-style para remover ── */
 var _itemToRemove=null;
 function abrirModalRemover(tipo,id,titulo,descricao){
   _itemToRemove={tipo:tipo, id:id};
@@ -2852,7 +2844,6 @@ function confirmarRemoverApple(){
   var frm = document.getElementById('form-rem-'+_itemToRemove.tipo+'-'+_itemToRemove.id);
   if(frm) frm.submit();
 }
-/* Restaurar posição do scroll após redirect sem pular para o topo */
 function restoreScrollPosition(){
   var y=sessionStorage.getItem('funil_scroll_y');
   if(y!==null){
@@ -2973,21 +2964,6 @@ app.post("/admin/funis/remover-caminho", async (req, res) => {
   res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
 });
 
-// AUDITORIA (salvar-anúncio via botão "Ações" do card, extensão): antes, este endpoint
-// exigia SEMPRE um `rotulo` explícito no corpo da requisição (400 se ausente), porque os
-// únicos chamadores eram fluxos que já pediam o rótulo ao operador (o construtor de funil
-// multi-etapas). O novo botão "📢 Salvar Anúncio" do dropdown "Ações" de cada card salva em
-// 1 clique, sem abrir modal nenhum — não existe rótulo pra pedir. Regra nova: `rotulo`
-// continua obrigatório para todo `tipo`, EXCETO 'ads': quando `tipo === 'ads'` e nenhum
-// `rotulo` é enviado, o PRÓPRIO SERVIDOR gera "ads01", "ads02", "ads03"... contando quantos
-// nós `tipo='ads'` já existem para aquele `slug`. A geração fica no servidor (nunca no
-// content.js) de propósito: evita que dois cliques rápidos em anúncios diferentes gerem o
-// mesmo número por uma corrida no cliente — a contagem e o INSERT acontecem em sequência
-// dentro da mesma requisição no servidor.
-// Também: quando o node já existe (mesmo slug+url — ex: o operador clica "Salvar Anúncio"
-// duas vezes no mesmo card), só atualiza tipo/rótulo se um rótulo EXPLÍCITO foi enviado —
-// nunca renumera um "adsNN" que já foi salvo antes, e a resposta devolve o rótulo final
-// usado (`rotulo`) para o pop-up de confirmação da extensão poder exibi-lo.
 app.post("/api/funis/salvar-node", async (req, res) => {
   const { slug, tipo, rotulo: rotuloRaw, url: urlRaw, checkout_url: checkoutRaw } = req.body;
   if (!slug || !tipo || !urlRaw) {
@@ -3000,7 +2976,6 @@ app.post("/api/funis/salvar-node", async (req, res) => {
   const checkout_url = checkoutRaw ? normalizeUrl(checkoutRaw) : checkoutRaw;
 
   try {
-    // 1. Resolve ou cria o nó da Landing Page (ou do Anúncio, quando tipo='ads')
     let landingNodeId;
     let rotuloResolvido = rotuloRaw || null;
     const { rows: existingLanding } = await query(
@@ -3011,9 +2986,6 @@ app.post("/api/funis/salvar-node", async (req, res) => {
     if (existingLanding.length > 0) {
       landingNodeId = existingLanding[0].id;
       rotuloResolvido = existingLanding[0].rotulo;
-      // Só atualiza tipo/rótulo se um rótulo EXPLÍCITO veio na requisição — para um
-      // salvamento rápido de 'ads' sem rótulo (o caso normal do botão da extensão), o node
-      // já existente mantém o rótulo original, nunca é renumerado.
       if (rotuloRaw) {
         await query(
           "UPDATE funnel_nodes SET tipo = $1, rotulo = $2 WHERE id = $3",
@@ -3039,7 +3011,6 @@ app.post("/api/funis/salvar-node", async (req, res) => {
       rotuloResolvido = rotuloFinal;
     }
 
-    // 2. Se houver checkout preenchido, resolve o nó do checkout e conecta
     if (checkout_url && checkout_url.trim()) {
       let checkoutNodeId;
       const cleanCheckout = checkout_url.trim();
@@ -3059,7 +3030,6 @@ app.post("/api/funis/salvar-node", async (req, res) => {
         checkoutNodeId = newCheckout[0].id;
       }
 
-      // 3. Cria a conexão (edge) entre a Landing Page e o Checkout se não existir
       const { rows: existingEdge } = await query(
         "SELECT id FROM funnel_edges WHERE from_node_id = $1 AND to_node_id = $2 LIMIT 1",
         [landingNodeId, checkoutNodeId]
@@ -3081,7 +3051,6 @@ app.post("/api/funis/salvar-node", async (req, res) => {
   }
 });
 
-// Página de visão geral — mapa de funis de todos os players
 app.get("/funis", async (_req, res) => {
   const { rows: pages } = await query(
     "SELECT slug, nome, url, tipo FROM pages ORDER BY created_at DESC"
@@ -3152,7 +3121,6 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
 .player-hdr{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
 .player-tipo-badge{font-size:15px}
 .player-nome{font-size:15px;font-weight:700;color:#fff;text-decoration:none}
-.player-nome:hover{color:var(--accent)}
 .player-edit-link{margin-left:auto;font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:4px 10px;border-radius:6px;white-space:nowrap}
 .player-edit-link:hover{background:var(--accent);color:#fff}
 .player-caminhos{display:flex;flex-direction:column;gap:8px}
@@ -3197,7 +3165,6 @@ ${semMapaHtml}
 </body>
 </html>`);
 });
-
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
 app.get("/dashboard", async (_req, res) => {
@@ -3376,7 +3343,7 @@ app.get("/dashboard", async (_req, res) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lowticket Monitor</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -3565,8 +3532,8 @@ tbody tr:hover td{background:var(--surface2)}
 .b-down{background:rgba(251,113,133,.13);color:#fb7185}
 .b-flat{background:rgba(136,136,170,.12);color:#9999b8}
 .b-off{background:rgba(120,120,140,.1);color:#777}
-.scalebar-bg{width:80px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-right:8px}
-.scalebar{height:5px;border-radius:3px;display:block}
+.scalebar-bg{width:80px;min-width:80px;max-width:80px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-right:8px;overflow:hidden}
+.scalebar{display:block;height:100%;border-radius:3px}
 .spark3{font-family:'Space Mono',monospace;font-size:13px}
 .win-btn{background:transparent;color:var(--muted);border:none;border-radius:5px;padding:5px 10px;font-size:11px;font-weight:600;cursor:pointer;font-family:'Space Grotesk'}
 .win-btn.active{background:var(--accent);color:#fff}
@@ -3617,7 +3584,7 @@ tbody tr:hover td{background:var(--surface2)}
   .tbl-panel table tbody td::before{content:attr(data-label);font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-right:10px;flex-shrink:0}
   .tbl-panel table tbody td.t-name{font-size:14px;font-weight:700;color:#fff;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px}
   .tbl-panel table tbody td.t-name::before{display:none}
-  .scalebar-bg{width:50px}
+  .scalebar-bg{width:80px;min-width:80px;max-width:80px}
 }
 @media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
 .search-wrap{position:relative;margin-bottom:14px}
@@ -4168,7 +4135,7 @@ function updateScoreCellsAndSort(){
     scoreTbody.appendChild(row);
   });
 }
-const maxAds=ultima[porAds[0]]?.ads||1;
+const maxAds=Math.max(...LP.map(p=>ultima[p]?.ads||0), 1);
 const MAX_PINNED=4;
 const storageKey="viva_dashboard_pinned_"+P.replace(/_$/g,"");
 const chartSeries=porAds.slice(0,8);
@@ -4374,7 +4341,7 @@ porAds.forEach((pag,idx)=>{
   const s=serie(pag).filter(v=>v!==null);
   const last3=s.slice(-3);
   const spark3=last3.length>=2?(last3[last3.length-1]>last3[0]?'<span style="color:#34d399">▲ sub</span>':last3[last3.length-1]<last3[0]?'<span style="color:#fb7185">▼ cai</span>':'<span style="color:#888">= est</span>'):"—";
-  const partPct=Math.round((x.at/maxAds)*100);
+  const partPct=Math.min(100, Math.max(0, Math.round((x.at/maxAds)*100)));
   const corLib=corBiblioteca(pag);
 
   // Monta célula do nome com badges de geo e nicho
@@ -4393,12 +4360,6 @@ porAds.forEach((pag,idx)=>{
   const tr=document.createElement("tr");
   if(P==="pag_")tr.dataset.pagName=pag;
   const checkAt=ultima[pag]?.ultimaColeta;
-  const tentativa=ultima[pag]?.tentativa;
-  const checkStatus=tentativa?.status;
-  const checkLabels={em_andamento:"em andamento",falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
-  const checkStatusHtml=tentativa?.relevante&&checkStatus
-    ?'<div style="color:#fb7185;font-size:10px" title="'+escapeAttr(tentativa.error||"")+'">'+(checkLabels[checkStatus]||"falhou")+'</div>'
-    :'';
   tr.dataset.search=(pag+" "+(ultima[pag]?.url||"")+" "+(m.geo||"")+" "+(m.nicho||"")).toLowerCase();
   const trendCell=P==="pag_"
     ?'<td data-label="Tendência" data-role="pag-window-trend">'+windowTrendHtml(pagWindowStats)+'</td>'
@@ -4421,7 +4382,6 @@ porAds.forEach((pag,idx)=>{
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+(ultima[pag]?.ads==null?'—':x.at)+'</td>'
     +'<td class="last-check-cell" data-slug="'+escapeAttr(ultima[pag]?.slug||"")+'" data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
     +(checkAt?new Date(checkAt).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
-    +checkStatusHtml
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +trendCell
@@ -4536,7 +4496,6 @@ if(!HD.dates.length||!HD.libs.length){
   if(metaEl)metaEl.textContent='('+rowCount+' registros)';
 }
 }
-
 function filtrarTabela(P){
   const termo=document.getElementById(P+"busca").value.trim().toLowerCase();
   const linhas=document.querySelectorAll("#"+P+"tbody tr");
@@ -4981,7 +4940,7 @@ async function refreshLastChecks(){
     if(!response.ok)throw new Error("Falha ao consultar últimas checagens");
     const checks=await response.json();
     const cells=new Map([...document.querySelectorAll(".last-check-cell")].map(cell=>[cell.dataset.slug,cell]));
-    const labels={falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
+    const labels={falha_timeout:"timeout",falha_bloqueio:"bloqueio Meta",falha_parse:"não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar"};
     for(const check of checks){
       const cell=cells.get(check.slug);
       if(!cell)continue;
@@ -4991,11 +4950,11 @@ async function refreshLastChecks(){
       }else{
         cell.append(document.createTextNode("—"));
       }
-      if(check.tentativa?.relevante&&check.tentativa?.status){
+      if(check.tentativa?.relevante&&labels[check.tentativa?.status]){
         const state=document.createElement("div");
         state.style.color="#fb7185";
         state.style.fontSize="10px";
-        state.textContent=labels[check.tentativa.status]||"falhou";
+        state.textContent=labels[check.tentativa.status];
         if(check.tentativa.error)state.title=check.tentativa.error;
         cell.appendChild(state);
       }
@@ -5176,7 +5135,7 @@ updateManualCheck();
 refreshLastChecks();
 setInterval(refreshLastChecks,30000);
 
-<\/script>
+</script>
 </body>
 </html>`
       .replace("__DADOS_DOM__", () => dadosDom)
@@ -5192,7 +5151,6 @@ setInterval(refreshLastChecks,30000);
 
 // ─── Scheduler ───────────────────────────────────────────────────────────────
 
-// O agendamento agora é feito externamente via rota GET /api/cron/tick (ex: UptimeRobot a cada 5 min)
 console.log("[CRON] Usando arquitetura de Fila Assíncrona via /api/cron/tick");
 
 // ─── Start ────────────────────────────────────────────────────────────────────
