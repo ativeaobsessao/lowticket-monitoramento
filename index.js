@@ -2,8 +2,9 @@ import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
 import { execSync } from "child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import pg from "pg";
+import { getBusinessSlot, processWithRetries, withTimeout } from "./scrape-orchestration.js";
 
 const { Pool } = pg;
 const app = express();
@@ -17,7 +18,12 @@ if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL environment variable is required.");
 }
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  connectionTimeoutMillis: 10_000,
+  query_timeout: 15_000,
+  statement_timeout: 15_000,
+});
 
 // O Neon (serverless) derruba conexões ociosas de tempos em tempos (autosuspend/reciclagem
 // do pooler). Sem este handler, um erro num cliente idle do pool vira uma exceção não
@@ -117,6 +123,10 @@ async function initDb() {
   await query(`
     CREATE INDEX IF NOT EXISTS idx_scrape_history_slug ON scrape_history(slug)
   `);
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_scrape_history_collected_at
+    ON scrape_history(collected_at DESC)
+  `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS scrape_latest (
@@ -124,6 +134,57 @@ async function initDb() {
       ads_count    INTEGER NOT NULL,
       collected_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
+  `);
+
+  await query(`ALTER TABLE scrape_history ADD COLUMN IF NOT EXISTS business_date DATE`);
+  await query(`
+    UPDATE scrape_history
+    SET business_date = (
+      (collected_at - INTERVAL '3 hours')
+      - CASE
+          WHEN EXTRACT(HOUR FROM collected_at - INTERVAL '3 hours') < 3
+          THEN INTERVAL '1 day'
+          ELSE INTERVAL '0 days'
+        END
+    )::date
+    WHERE slot IS NOT NULL AND business_date IS NULL
+  `);
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_scrape_history_slot_business_date
+    ON scrape_history(slug, slot, business_date)
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS scrape_attempts (
+      id           TEXT PRIMARY KEY,
+      slug         TEXT NOT NULL,
+      source       TEXT NOT NULL,
+      slot         SMALLINT,
+      business_date DATE,
+      status       TEXT NOT NULL,
+      ads_count    INTEGER,
+      error        TEXT,
+      started_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMP,
+      lease_owner  TEXT NOT NULL
+    )
+  `);
+  await query(`
+    CREATE INDEX IF NOT EXISTS idx_scrape_attempts_slug_started
+    ON scrape_attempts(slug, started_at DESC)
+  `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS scrape_worker_lease (
+      lease_key    TEXT PRIMARY KEY,
+      owner_id     TEXT,
+      expires_at   TIMESTAMP NOT NULL,
+      blocked_until TIMESTAMP
+    )
+  `);
+  await query(`
+    INSERT INTO scrape_worker_lease (lease_key, expires_at)
+    VALUES ('scraper', NOW() - INTERVAL '1 day')
+    ON CONFLICT (lease_key) DO NOTHING
   `);
 
   // Migrações: garante colunas novas em banco antigo (seguro rodar sempre)
@@ -318,7 +379,7 @@ async function extractCount(page) {
     }
 
     return null;
-  }).catch(() => null);
+  });
 }
 
 async function waitForCounter(page, maxWaitMs = 18000) {
@@ -360,7 +421,7 @@ async function detectPageState(page) {
       bloqueio: /captcha|checkpoint|confirme que voc[eê] [ée] humano|confirm (that )?you.?re (a )?human|security check|verifica[cç][aã]o de seguran[cç]a/i.test(t) || /\/login|checkpoint/i.test(location.pathname),
       texto: t.slice(0, 1500),
     };
-  }).catch(() => null);
+  });
 }
 
 // Espera o contador OU a tela de vazio. O vazio só vale se a frase + título da Biblioteca
@@ -453,119 +514,50 @@ async function scrapeWithContext(context, url, diag = null) {
   }
 }
 
-async function scrapeAdCount(url, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    const browser = await chromium.launch({
-      executablePath: getChromiumPath(),
-      headless: true,
-      args: getBrowserLaunchArgs(),
-    });
-    try {
-      const context = await createStealthContext(browser);
-      const count = await scrapeWithContext(context, url);
-      if (count !== null) {
-        console.log(`[SCRAPE] attempt=${attempt} count=${count}`);
-        return count;
-      }
-      console.warn(`[SCRAPE] attempt=${attempt} — count not found, retrying...`);
-    } catch (err) {
-      console.error(`[SCRAPE] attempt=${attempt} error: ${err.message}`);
-    } finally {
-      await browser.close();
-    }
-    if (attempt < retries) await new Promise((r) => setTimeout(r, 4000));
-  }
-  console.error(`[SCRAPE] all ${retries} attempts failed, returning null`);
-  return null;
-}
-
-// Dedupe considera slot — só bloqueia duplicata do MESMO slot
-async function saveCount(slug, count, slot) {
-  console.log(`[SAVECOUNT] slug=${slug} slot=${slot}`);
-  const { rows: recent } = await query(
-    `SELECT id FROM scrape_history
-     WHERE slug = $1
-       AND slot IS NOT DISTINCT FROM $2
-       AND collected_at >= NOW() - INTERVAL '60 seconds'
-     LIMIT 1`,
-    [slug, slot]
-  );
-
-  await query(
-    `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (slug) DO UPDATE
-       SET ads_count    = EXCLUDED.ads_count,
-           collected_at = EXCLUDED.collected_at`,
-    [slug, count]
-  );
-
-  if (recent.length === 0) {
-    await query("INSERT INTO scrape_history (slug, ads_count, slot) VALUES ($1, $2, $3)", [slug, count, slot]);
-    console.log(`[HISTORY] slug=${slug} slot=${slot} count=${count} saved`);
-  } else {
-    console.log(`[HISTORY] slug=${slug} slot=${slot} skipped duplicate`);
-  }
-}
-
 // Captura inicial no momento do cadastro (individual)
 async function captureInicial(slug, url) {
+  let lease;
   try {
-    const count = await scrapeAdCount(url, 2);
-    if (count === null) {
-      console.warn(`[DESCOBERTA] slug=${slug} falhou, nada gravado`);
+    lease = await acquireScrapeLease("cadastro");
+    if (!lease) {
+      console.warn(`[DESCOBERTA] slug=${slug} captura inicial adiada: outra coleta está em andamento`);
       return null;
     }
-    await query(
-      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
-      [slug, count]
+    const [result] = await processBatch(
+      [{ slug, nome: slug, url }],
+      null,
+      null,
+      null,
+      { source: "cadastro", lease, persistInitial: true },
     );
-    await query(
-      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE
-         SET ads_count    = EXCLUDED.ads_count,
-             collected_at = EXCLUDED.collected_at`,
-      [slug, count]
-    );
-    console.log(`[DESCOBERTA] slug=${slug} inicial=${count} capturado no cadastro`);
-    return count;
+    if (result.count === null) console.warn(`[DESCOBERTA] slug=${slug} falhou, valor inicial não capturado`);
+    else console.log(`[DESCOBERTA] slug=${slug} inicial=${result.count} capturado no cadastro`);
+    return result.count;
   } catch (err) {
     console.error(`[DESCOBERTA] falha ao capturar inicial de slug=${slug}: ${err.message}`);
     return null;
+  } finally {
+    if (lease) await lease.release();
   }
-}
-
-// Versão de captureInicial que reutiliza browser já aberto (para lotes)
-async function captureInicialWithContext(context, slug, url) {
-  let count = null;
-  for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-    try {
-      count = await scrapeWithContext(context, url);
-    } catch (err) {
-      console.error(`[LOTE] slug=${slug} attempt=${attempt} error: ${err.message}`);
-    }
-  }
-  if (count === null) return null;
-  const final = count;
-  await query(`UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`, [slug, final]);
-  await query(
-    `INSERT INTO scrape_latest (slug, ads_count, collected_at) VALUES ($1, $2, NOW())
-     ON CONFLICT (slug) DO UPDATE SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
-    [slug, final]
-  );
-  return final;
 }
 
 // Processa lote em background (fire-and-forget)
 async function runLote(itens) {
-  if (isRunning) {
+  let lease;
+  try {
+    lease = await acquireScrapeLease("cadastro_lote");
+  } catch (err) {
+    console.error(`[LOTE] não foi possível reservar worker: ${err.message}`);
+    loteStatus.erros.push("Não foi possível reservar o worker de coleta.");
+    loteStatus.emAndamento = false;
+    return;
+  }
+  if (!lease) {
     console.warn("[LOTE] abortado — já existe uma coleta em andamento (cron ou outro lote)");
     loteStatus.erros.push("Abortado: já havia uma coleta (cron ou outro lote) em andamento. Tente de novo em alguns minutos.");
     loteStatus.emAndamento = false;
     return;
   }
-  isRunning = true;
   loteStatus = {
     emAndamento: true,
     total: itens.length,
@@ -577,17 +569,9 @@ async function runLote(itens) {
   };
   console.log(`[LOTE] ===== iniciado — ${itens.length} itens =====`);
 
-  let browser;
   try {
-    browser = await chromium.launch({
-      executablePath: getChromiumPath(),
-      headless: true,
-      args: getBrowserLaunchArgs(),
-    });
-    const context = await createStealthContext(browser);
-
+    const pages = [];
     for (const item of itens) {
-      loteStatus.atual = item.nome;
       const slug = toSlug(item.nome);
       if (!slug) {
         loteStatus.erros.push(`"${item.nome}" — nome inválido, ignorado`);
@@ -602,20 +586,37 @@ async function runLote(itens) {
              instagram_url = COALESCE(EXCLUDED.instagram_url, pages.instagram_url)`,
           [slug, item.nome, item.url, item.tipo, item.instagram_url || null]
         );
-        await captureInicialWithContext(context, slug, item.url);
-        console.log(`[LOTE] slug=${slug} cadastrado e capturado (${loteStatus.concluidos + 1}/${itens.length})`);
+        pages.push({ slug, nome: item.nome, url: item.url });
       } catch (err) {
         console.error(`[LOTE] erro no item slug=${slug}: ${err.message}`);
         loteStatus.erros.push(`"${item.nome}" — erro: ${err.message}`);
+        loteStatus.concluidos++;
       }
-      loteStatus.concluidos++;
+    }
+    const reportedSlugs = new Set();
+    const results = await processBatch(
+      pages,
+      null,
+      (result) => {
+        if (!reportedSlugs.has(result.slug)) {
+          reportedSlugs.add(result.slug);
+          loteStatus.concluidos++;
+        }
+      },
+      (page) => { loteStatus.atual = page.nome; },
+      { source: "cadastro_lote", lease, persistInitial: true },
+    );
+    for (const result of results) {
+      if (result.count === null) {
+        loteStatus.erros.push(`"${result.nome}" — ${result.falha || "falha na captura inicial"}`);
+      }
+      console.log(`[LOTE] slug=${result.slug} cadastro e captura finalizados (${loteStatus.concluidos}/${itens.length})`);
     }
   } catch (err) {
     console.error(`[LOTE] erro fatal: ${err.message}`);
     loteStatus.erros.push(`Erro fatal: ${err.message}`);
   } finally {
-    if (browser) await browser.close();
-    isRunning = false;
+    await lease.release();
     loteStatus.emAndamento = false;
     loteStatus.atual = null;
     loteStatus.finalizadoEm = new Date().toISOString();
@@ -639,7 +640,17 @@ async function mirrorToSheet(rows) {
 }
 
 let isRunning = false;
-let blockedUntil = 0;
+const SCRAPE_LEASE_KEY = "scraper";
+const SCRAPE_LEASE_MS = 2 * 60 * 1000;
+const SCRAPE_HEARTBEAT_MS = 30 * 1000;
+const PAGE_TIMEOUT_MS = 120 * 1000;
+const PAGE_ATTEMPT_BUDGET_MS = 6 * 60 * 1000;
+const BATCH_TIMEOUT_MS = 45 * 60 * 1000;
+const BROWSER_START_TIMEOUT_MS = 30 * 1000;
+const BROWSER_CONNECT_TIMEOUT_MS = 15 * 1000;
+const PAGE_PAUSE_MS = 1500;
+const BROWSER_CLOSE_TIMEOUT_MS = 5000;
+let leaseHeartbeat = null;
 
 let loteStatus = {
   emAndamento: false,
@@ -722,187 +733,539 @@ function parseLoteInput(texto) {
 }
 
 function getCurrentSlot() {
-  const now = new Date();
-  const hour = now.getUTCHours();
-  if (hour >= 1 && hour < 6) return 22;
-  if (hour >= 6 && hour < 15) return 3;
-  return 12;
+  return getBusinessSlot();
 }
 
-async function processBatch(pages, slot, onResult = null, onPageStart = null) {
+async function withScrapeLease(lease, callback) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT owner_id FROM scrape_worker_lease
+       WHERE lease_key = $1 AND expires_at > NOW()
+       FOR UPDATE`,
+      [SCRAPE_LEASE_KEY],
+    );
+    if (lease.lost || rows[0]?.owner_id !== lease.ownerId) {
+      throw new Error("A reserva do worker expirou ou foi assumida por outra execução.");
+    }
+    const result = await callback(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK").catch((rollbackError) => {
+      console.error(`[LEASE] rollback falhou: ${rollbackError.message}`);
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function acquireScrapeLease(source) {
+  if (isRunning) return null;
+  isRunning = true;
+  const ownerId = randomUUID();
+  try {
+    const { rows } = await query(
+      `INSERT INTO scrape_worker_lease (lease_key, owner_id, expires_at)
+       VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond'))
+       ON CONFLICT (lease_key) DO UPDATE
+         SET owner_id = EXCLUDED.owner_id,
+             expires_at = EXCLUDED.expires_at
+         WHERE scrape_worker_lease.expires_at <= NOW()
+       RETURNING owner_id`,
+      [SCRAPE_LEASE_KEY, ownerId, SCRAPE_LEASE_MS],
+    );
+    if (rows.length === 0) {
+      isRunning = false;
+      console.warn(`[LEASE] ${source} não iniciou: worker reservado por outra instância`);
+      return null;
+    }
+
+    const lease = { ownerId, lost: false, release: null };
+    await withScrapeLease(lease, async (client) => {
+      const { rows: staleAttempts } = await client.query(
+        `UPDATE scrape_attempts
+         SET status = 'falha_execucao',
+             error = 'A execução anterior perdeu a reserva do worker.',
+             completed_at = NOW()
+         WHERE status = 'em_andamento' AND lease_owner <> $1
+         RETURNING slug, started_at`,
+        [ownerId],
+      );
+      for (const attempt of staleAttempts) {
+        await client.query(
+          `UPDATE pages SET last_status = 'falha_execucao', last_error = $2
+           WHERE slug = $1 AND last_attempt_at <= $3`,
+          [attempt.slug, "A execução anterior foi interrompida.", attempt.started_at],
+        );
+      }
+    });
+
+    leaseHeartbeat = setInterval(async () => {
+      try {
+        const { rowCount } = await query(
+          `UPDATE scrape_worker_lease
+           SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
+           WHERE lease_key = $1 AND owner_id = $2`,
+          [SCRAPE_LEASE_KEY, ownerId, SCRAPE_LEASE_MS],
+        );
+        if (rowCount !== 1) {
+          lease.lost = true;
+          console.error(`[LEASE] ${source} perdeu a reserva do worker`);
+        }
+      } catch (err) {
+        console.error(`[LEASE] heartbeat de ${source} falhou: ${err.message}`);
+      }
+    }, SCRAPE_HEARTBEAT_MS);
+    leaseHeartbeat.unref();
+
+    lease.release = async () => {
+      if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+      leaseHeartbeat = null;
+      try {
+        await query(
+          `UPDATE scrape_worker_lease
+           SET owner_id = NULL, expires_at = NOW() - INTERVAL '1 second'
+           WHERE lease_key = $1 AND owner_id = $2`,
+          [SCRAPE_LEASE_KEY, ownerId],
+        );
+      } catch (err) {
+        console.error(`[LEASE] não foi possível liberar reserva de ${source}: ${err.message}; ela expirará automaticamente`);
+      } finally {
+        isRunning = false;
+      }
+    };
+    console.log(`[LEASE] ${source} reservou o worker owner=${ownerId}`);
+    return lease;
+  } catch (err) {
+    try {
+      await query(
+        `UPDATE scrape_worker_lease
+         SET owner_id = NULL, expires_at = NOW() - INTERVAL '1 second'
+         WHERE lease_key = $1 AND owner_id = $2`,
+        [SCRAPE_LEASE_KEY, ownerId],
+      );
+    } catch (releaseError) {
+      console.error(`[LEASE] não foi possível liberar reserva após erro: ${releaseError.message}`);
+    }
+    isRunning = false;
+    throw err;
+  }
+}
+
+async function recordAttemptStart(page, source, slotInfo, lease) {
+  const attemptId = randomUUID();
+  await withScrapeLease(lease, async (client) => {
+    await client.query(
+      `INSERT INTO scrape_attempts
+         (id, slug, source, slot, business_date, status, lease_owner)
+       VALUES ($1, $2, $3, $4, $5, 'em_andamento', $6)`,
+      [attemptId, page.slug, source, slotInfo?.slot ?? null, slotInfo?.businessDate ?? null, lease.ownerId],
+    );
+    await client.query(
+      `UPDATE pages SET last_attempt_at = NOW(), last_status = 'em_andamento', last_error = NULL
+       WHERE slug = $1`,
+      [page.slug],
+    );
+  });
+  return attemptId;
+}
+
+async function saveSuccessfulCount(client, slug, count, slotInfo) {
+  await client.query(
+    `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (slug) DO UPDATE
+       SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+    [slug, count],
+  );
+
+  if (!slotInfo) {
+    console.log(`[LATEST] slug=${slug} count=${count} (manual; sem novo ponto no histórico automático)`);
+    return;
+  }
+
+  const { rows: existing } = await client.query(
+    `SELECT id FROM scrape_history
+     WHERE slug = $1 AND slot = $2 AND business_date = $3
+     LIMIT 1`,
+    [slug, slotInfo.slot, slotInfo.businessDate],
+  );
+  if (existing.length === 0) {
+    await client.query(
+      `INSERT INTO scrape_history (slug, ads_count, slot, business_date)
+       VALUES ($1, $2, $3, $4)`,
+      [slug, count, slotInfo.slot, slotInfo.businessDate],
+    );
+    console.log(`[HISTORY] slug=${slug} slot=${slotInfo.slot} date=${slotInfo.businessDate} count=${count} saved`);
+  } else {
+    console.log(`[HISTORY] slug=${slug} slot=${slotInfo.slot} date=${slotInfo.businessDate} skipped duplicate`);
+  }
+}
+
+async function completeAttempt(attemptId, page, result, options) {
+  const { lease, slotInfo, persistInitial } = options;
+  await withScrapeLease(lease, async (client) => {
+    if (result.count !== null && !result.dbError) {
+      await saveSuccessfulCount(client, page.slug, result.count, slotInfo);
+      if (persistInitial) {
+        await client.query(
+          `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
+          [page.slug, result.count],
+        );
+      }
+    }
+    const { rowCount } = await client.query(
+      `UPDATE scrape_attempts
+       SET status = $2, ads_count = $3, error = $4, completed_at = NOW()
+       WHERE id = $1 AND status = 'em_andamento' AND lease_owner = $5`,
+      [attemptId, result.status, result.count, result.falha ?? null, lease.ownerId],
+    );
+    if (rowCount !== 1) throw new Error(`Não foi possível finalizar tentativa ${attemptId}.`);
+    await client.query(
+      `UPDATE pages SET last_attempt_at = NOW(), last_status = $2, last_error = $3 WHERE slug = $1`,
+      [page.slug, result.status, result.falha ?? null],
+    );
+  });
+}
+
+async function markAttemptWriteFailure(attemptId, page, error, lease) {
+  const message = "A coleta terminou, mas não foi possível persistir o resultado.";
+  try {
+    await withScrapeLease(lease, async (client) => {
+      await client.query(
+        `WITH failed AS (
+           UPDATE scrape_attempts
+           SET status = 'falha_gravacao', error = $2, completed_at = NOW()
+           WHERE id = $1 AND status = 'em_andamento' AND lease_owner = $3
+           RETURNING slug
+         )
+         UPDATE pages p SET last_attempt_at = NOW(), last_status = 'falha_gravacao', last_error = $4
+         FROM failed f WHERE p.slug = f.slug`,
+        [attemptId, `${message} ${error.message}`.slice(0, 500), lease.ownerId, message],
+      );
+    });
+  } catch (recordError) {
+    console.error(`[BATCH] slug=${page.slug} não foi possível persistir falha de gravação: ${recordError.message}`);
+  }
+}
+
+async function processBatch(pages, slotInfo, onResult = null, onPageStart = null, options = {}) {
+  const { source = slotInfo ? "cron" : "manual", lease, persistInitial = false } = options;
+  if (!lease) throw new Error("A coleta exige uma reserva durável do worker.");
+  const batchTimeoutMs = Math.ceil(pages.length / 5) * BATCH_TIMEOUT_MS;
+  const batchDeadline = Date.now() + batchTimeoutMs;
   let browser;
+  let browserServer;
   let context;
-  const results = [];
+  let pagesSinceLaunch = 0;
 
   async function launchBrowser() {
-    if (browser) await browser.close();
-    browser = await chromium.launch({
+    const server = await chromium.launchServer({
       executablePath: getChromiumPath(),
       headless: true,
+      timeout: BROWSER_START_TIMEOUT_MS,
       args: getBrowserLaunchArgs(),
     });
-    context = await createStealthContext(browser);
-  }
-
-  try {
-    await launchBrowser(); // Início limpo
-    
-    for (let i = 0; i < pages.length; i++) {
-      const p = pages[i];
-      if (onPageStart) onPageStart(p);
-
-      // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
-      // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
-      let count = null;
-      let falhaMotivo = null;
-      let diag = { status: null, detalhe: null };
-            if (!isMetaLibraryUrl(p.url || "")) {
-        falhaMotivo = `URL inválida (não é da Biblioteca da Meta): "${p.url}"`;
-        diag = { status: "falha_url_invalida", detalhe: falhaMotivo };
-        console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
-      } else {
-        for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-          try {
-            count = await scrapeWithContext(context, p.url, diag);
-          } catch (err) {
-            falhaMotivo = err.message;
-            console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
-          }
-        }
-      }
-
-      // FIX (fila travada / starvation do cron): registra a tentativa (sucesso OU
-      // falha) em pages.last_attempt_at. A query de /api/cron/tick agora ordena por
-      // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
-      // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
-      // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
-      // Status classificado: ok / ok_zero / falha_bloqueio / falha_timeout / falha_parse / falha_url_invalida
-      const statusFinal = count !== null
-        ? (diag.status === "ok_zero" ? "ok_zero" : "ok")
-        : (diag.status && diag.status.startsWith("falha_") ? diag.status : "falha_timeout");
-      const erroFinal = count !== null ? null : (String(diag.detalhe || falhaMotivo || "").slice(0, 500) || null);
-      await query(
-        `UPDATE pages SET last_attempt_at = NOW(), last_status = $2, last_error = $3 WHERE slug = $1`,
-        [p.slug, statusFinal, erroFinal]
-      );
-
-      // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
-      // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
-      // da janela de 8h.
-      if (count === null) {
-        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta [${statusFinal}] ${erroFinal || "sem detalhe"} — pulado, histórico preservado (sem gravar 0 falso)`);
-        const result = { slug: p.slug, nome: p.nome, count: null, status: statusFinal, falha: erroFinal || falhaMotivo || "falha desconhecida" };
-        results.push(result);
-        if (onResult) onResult(result);
-        await new Promise(r => setTimeout(r, 1500));
-        continue;
-      }
-
-      const final = count;
-
-      try {
-        if (slot !== null && slot !== undefined) {
-          await saveCount(p.slug, final, slot);
-        } else {
-          await query(
-            `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-             VALUES ($1, $2, NOW())
-             ON CONFLICT (slug) DO UPDATE
-               SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
-            [p.slug, final]
-          );
-          console.log(`[LATEST] slug=${p.slug} count=${final} (manual)`);
-        }
-        const result = { slug: p.slug, nome: p.nome, count: final, status: diag.status === "ok_zero" ? "ok_zero" : "ok" };
-        results.push(result);
-        if (onResult) onResult(result);
-      } catch (dbErr) {
-        console.error(`[BATCH] slug=${p.slug} count=${final} COLETOU MAS FALHOU AO GRAVAR NO BANCO: ${dbErr.message}`);
-        try {
-          await query(
-            `UPDATE pages SET last_attempt_at = NOW(), last_status = 'falha_gravacao', last_error = $2 WHERE slug = $1`,
-            [p.slug, "Falha ao gravar a contagem no banco de dados."]
-          );
-        } catch (statusErr) {
-          console.error(`[BATCH] slug=${p.slug} também falhou ao atualizar status: ${statusErr.message}`);
-        }
-        const result = { slug: p.slug, nome: p.nome, count: null, status: "falha_gravacao", falha: "Não foi possível salvar a contagem no banco de dados.", dbError: true };
-        results.push(result);
-        if (onResult) onResult(result);
-      }
-
-      // Delay tático entre páginas
-      await new Promise(r => setTimeout(r, 1500));
+    browserServer = server;
+    try {
+      browser = await chromium.connect(server.wsEndpoint(), { timeout: BROWSER_CONNECT_TIMEOUT_MS });
+      context = await createStealthContext(browser);
+    } catch (err) {
+      await closeBrowser("falha de inicialização");
+      throw err;
     }
-  } catch (err) {
-    console.error(`[BATCH] fatal error: ${err.message}`);
-  } finally {
-    if (browser) await browser.close();
   }
 
-  const resultsOk = results.filter((r) => r.count !== null);
+  async function closeBrowser(reason) {
+    const currentServer = browserServer;
+    browser = null;
+    browserServer = null;
+    context = null;
+    pagesSinceLaunch = 0;
+    if (!currentServer) return;
+    try {
+      await withTimeout(() => currentServer.close(), BROWSER_CLOSE_TIMEOUT_MS);
+    } catch (err) {
+      console.error(`[BATCH] fechamento do Chromium (${reason}) falhou: ${err.message}`);
+      const child = currentServer.process();
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          const exited = new Promise((resolve) => {
+            if (child.exitCode !== null || child.signalCode !== null) resolve();
+            else child.once("exit", resolve);
+          });
+          child.kill("SIGKILL");
+          await withTimeout(() => exited, BROWSER_CLOSE_TIMEOUT_MS);
+        } catch (killError) {
+          console.error(`[BATCH] encerramento forçado do Chromium (${reason}) falhou: ${killError.message}`);
+        }
+      }
+    }
+  }
+
+  async function attemptPage(page, pass) {
+    if (onPageStart) onPageStart(page);
+    const slotInfoForAttempt = slotInfo
+      ? { slot: slotInfo.slot, businessDate: slotInfo.businessDate }
+      : null;
+    const attemptId = await recordAttemptStart(page, source, slotInfoForAttempt, lease);
+    const diag = { status: null, detalhe: null };
+    let count = null;
+    let falha = null;
+
+    if (!isMetaLibraryUrl(page.url || "")) {
+      falha = `URL inválida (não é da Biblioteca da Meta): "${page.url}"`;
+      diag.status = "falha_url_invalida";
+      diag.detalhe = falha;
+      console.error(`[BATCH] slug=${page.slug} ${falha}`);
+    } else {
+      try {
+        count = await withTimeout(
+          async () => {
+            if (!browser || !browser.isConnected()) await launchBrowser();
+            return scrapeWithContext(context, page.url, diag);
+          },
+          PAGE_TIMEOUT_MS,
+          async () => {
+            console.error(`[BATCH] slug=${page.slug} pass=${pass} excedeu timeout de ${PAGE_TIMEOUT_MS}ms; fechando Chromium`);
+            await closeBrowser("timeout de página");
+          },
+        );
+        pagesSinceLaunch++;
+      } catch (err) {
+        falha = err.message;
+        if (err.name === "TimeoutError" || err.errors?.some((nested) => nested.name === "TimeoutError")) {
+          diag.status = "falha_timeout";
+          diag.detalhe = err.message;
+        } else if (!diag.status) {
+          diag.status = "falha_execucao";
+          diag.detalhe = err.message;
+        }
+        console.error(`[BATCH] slug=${page.slug} pass=${pass} erro: ${err.message}`);
+      }
+    }
+
+    const status = count !== null
+      ? diag.status === "ok_zero" ? "ok_zero" : "ok"
+      : diag.status?.startsWith("falha_") ? diag.status : "falha_timeout";
+    const result = {
+      slug: page.slug,
+      nome: page.nome,
+      count,
+      status,
+      falha: count === null ? (String(diag.detalhe || falha || "falha desconhecida").slice(0, 500)) : null,
+      retryable: status !== "falha_url_invalida",
+    };
+
+    try {
+      await completeAttempt(attemptId, page, result, { lease, slotInfo: slotInfoForAttempt, persistInitial });
+    } catch (dbErr) {
+      console.error(`[BATCH] slug=${page.slug} count=${count} falha ao gravar a tentativa: ${dbErr.message}`);
+      await markAttemptWriteFailure(attemptId, page, dbErr, lease);
+      result.count = null;
+      result.status = "falha_gravacao";
+      result.falha = "A coleta foi feita, mas não foi possível salvar o resultado.";
+      result.dbError = true;
+      result.retryable = true;
+    }
+
+    if (onResult) onResult(result);
+    if (pagesSinceLaunch >= 5) await closeBrowser("limite de cinco páginas");
+    await new Promise((resolve) => setTimeout(resolve, PAGE_PAUSE_MS));
+    return { ...result, ok: result.count !== null && !result.dbError };
+  }
+
+  let results;
+  try {
+    results = await processWithRetries(pages, attemptPage, {
+      maxPasses: 2,
+      isSuccess: (result) => result.ok,
+      shouldRetry: (result) => result.retryable,
+      shouldStartRetryPass: ({ pending, nextPass }) => {
+        const retryBudgetMs = pending.length * (PAGE_ATTEMPT_BUDGET_MS + PAGE_PAUSE_MS);
+        if (Date.now() + retryBudgetMs <= batchDeadline) return true;
+        console.warn(
+          `[BATCH] pass=${nextPass} não iniciada: orçamento restante insuficiente para ${pending.length} retentativas; ` +
+          "todas as bibliotecas já têm o resultado da primeira passagem registrado",
+        );
+        return false;
+      },
+    });
+    for (const result of results) {
+      if (!result.ok) {
+        console.warn(`[BATCH] slug=${result.slug} falhou após até duas passagens [${result.status}] ${result.falha || ""}`);
+      }
+    }
+  } finally {
+    await closeBrowser("fim do lote");
+  }
+
+  const resultsOk = results.filter((result) => result.count !== null && !result.dbError);
   if (resultsOk.length > 0) {
     await mirrorToSheet(resultsOk);
   }
-  return results;
+  return results.map(({ ok, retryable, ...result }) => result);
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
+app.get("/api/ultima-checagem", async (_req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT p.slug,
+             CASE
+               WHEN a.checked_at IS NOT NULL
+                 AND (p.last_attempt_at IS NULL OR a.checked_at >= p.last_attempt_at)
+               THEN a.checked_at
+               ELSE COALESCE(p.last_attempt_at, l.collected_at)
+             END AS checked_at,
+             CASE
+               WHEN a.checked_at IS NOT NULL
+                 AND (p.last_attempt_at IS NULL OR a.checked_at >= p.last_attempt_at)
+               THEN a.status
+               ELSE p.last_status
+             END AS status,
+             CASE
+               WHEN a.checked_at IS NOT NULL
+                 AND (p.last_attempt_at IS NULL OR a.checked_at >= p.last_attempt_at)
+               THEN a.error
+               ELSE p.last_error
+             END AS error
+      FROM pages p
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(completed_at, started_at) AS checked_at, status, error
+        FROM scrape_attempts
+        WHERE slug = p.slug
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      ) a ON TRUE
+      LEFT JOIN scrape_latest l ON l.slug = p.slug
+      ORDER BY p.slug
+    `);
+    res.set("Cache-Control", "no-store").json(rows);
+  } catch (err) {
+    console.error(`[API] falha ao consultar última checagem: ${err.message}`);
+    res.status(500).json({ error: "Não foi possível consultar a última checagem." });
+  }
+});
+
 app.get("/api/cron/tick", async (req, res) => {
   res.json({ status: "alive", message: "Tick received" });
-  
-  if (isRunning) return;
-  if (Date.now() < blockedUntil) return;
-  isRunning = true;
-  
+  let lease;
   try {
-    const slot = getCurrentSlot();
-    // FIX (fila travada / starvation): ORDER BY p.last_attempt_at ASC NULLS FIRST
-    // garante rotação justa entre as páginas pendentes do slot. Sem isso, como a
-    // query não tinha ordenação explícita, o Postgres devolvia consistentemente as
-    // mesmas linhas (praticamente a ordem física da tabela) — então páginas que
-    // falham sempre (ex: bloqueio da Meta numa URL específica) nunca saíam do topo
-    // do resultado e ocupavam o LIMIT 5 inteiro em TODO tick, travando a coleta de
-    // qualquer outra página pendente daquele slot. Agora, toda página tentada
-    // (sucesso ou falha) vai pro fim da fila, e páginas nunca tentadas (NULL) vêm
-    // primeiro.
+    const { rows: cooldownRows } = await query(
+      `SELECT blocked_until FROM scrape_worker_lease WHERE lease_key = $1`,
+      [SCRAPE_LEASE_KEY],
+    );
+    const blockedUntil = cooldownRows[0]?.blocked_until
+      ? new Date(cooldownRows[0].blocked_until)
+      : null;
+    if (blockedUntil && blockedUntil.getTime() > Date.now()) {
+      console.warn(`[TICK] ignorado durante cooldown até ${blockedUntil.toISOString()}`);
+      return;
+    }
+
+    if (isRunning) {
+      console.warn("[TICK] ignorado: já existe execução ativa nesta instância");
+      return;
+    }
+    lease = await acquireScrapeLease("cron");
+    if (!lease) {
+      console.warn("[TICK] ignorado: outra instância mantém a reserva durável do worker");
+      return;
+    }
+
+    const slotInfo = getCurrentSlot();
     const { rows: pages } = await query(`
       SELECT p.slug, p.nome, p.url
       FROM pages p
       WHERE NOT EXISTS (
         SELECT 1 FROM scrape_history sh 
         WHERE sh.slug = p.slug 
-          AND sh.slot = $1 
-          AND sh.collected_at >= NOW() - INTERVAL '8 hours'
+          AND sh.slot = $1
+          AND sh.business_date = $2
       )
       ORDER BY p.last_attempt_at ASC NULLS FIRST
       LIMIT 5;
-    `, [slot]);
+    `, [slotInfo.slot, slotInfo.businessDate]);
 
     if (pages.length === 0) {
-      isRunning = false;
+      console.log(`[TICK] nenhuma biblioteca pendente para slot=${slotInfo.slot} date=${slotInfo.businessDate}`);
       return;
     }
 
-    console.log(`[TICK] Iniciando lote de ${pages.length} paginas para o slot ${slot}...`);
-    const results = await processBatch(pages, slot);
+    console.log(`[TICK] Iniciando lote de ${pages.length} páginas para slot=${slotInfo.slot} date=${slotInfo.businessDate}...`);
+    const results = await processBatch(pages, slotInfo, null, null, { source: "cron", lease });
     const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
     const metaRes = results.filter(r => metaSlugs.has(r.slug));
     const FALHAS_TECNICAS = ["falha_bloqueio", "falha_timeout", "falha_parse"];
     if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError && FALHAS_TECNICAS.includes(r.status))) {
-      blockedUntil = Date.now() + 90 * 60 * 1000;
-      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam (${metaRes.map(r => r.status).join(", ")}) — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
+      const { rows } = await query(
+        `UPDATE scrape_worker_lease
+         SET blocked_until = NOW() + INTERVAL '90 minutes'
+         WHERE lease_key = $1 AND owner_id = $2
+         RETURNING blocked_until`,
+        [SCRAPE_LEASE_KEY, lease.ownerId],
+      );
+      if (rows[0]) {
+        console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam (${metaRes.map(r => r.status).join(", ")}) — cooldown de 90 min até ${new Date(rows[0].blocked_until).toISOString()}`);
+      }
     }
-    console.log(`[TICK] Lote do slot ${slot} finalizado.`);
+    console.log(`[TICK] Lote do slot=${slotInfo.slot} finalizado.`);
   } catch (err) {
     console.error("[TICK] Erro geral:", err);
   } finally {
-    isRunning = false;
+    if (lease) await lease.release();
   }
 });
+
+async function saveExtensionInitial(slug, count) {
+  const client = await pool.connect();
+  const attemptId = randomUUID();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
+      [slug, count],
+    );
+    await client.query(
+      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (slug) DO UPDATE
+         SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+      [slug, count],
+    );
+    await client.query(
+      `INSERT INTO scrape_history (slug, ads_count, slot)
+       VALUES ($1, $2, NULL)`,
+      [slug, count],
+    );
+    await client.query(
+      `INSERT INTO scrape_attempts
+         (id, slug, source, status, ads_count, started_at, completed_at, lease_owner)
+       VALUES ($1, $2, 'cadastro_extensao', 'ok', $3, NOW(), NOW(), 'extension')`,
+      [attemptId, slug, count],
+    );
+    await client.query(
+      `UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok', last_error = NULL
+       WHERE slug = $1`,
+      [slug],
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch((rollbackError) => {
+      console.error(`[DESCOBERTA] rollback de contagem da extensão falhou: ${rollbackError.message}`);
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 app.post("/api/salvar", async (req, res) => {
   const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
@@ -928,22 +1291,7 @@ app.post("/api/salvar", async (req, res) => {
   let inicial = ads_count_inicial;
   if (inicial !== undefined && inicial !== null) {
     const countNum = parseInt(inicial, 10) || 0;
-    await query(
-      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
-      [slug, countNum]
-    );
-    await query(
-      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE
-         SET ads_count    = EXCLUDED.ads_count,
-             collected_at = EXCLUDED.collected_at`,
-      [slug, countNum]
-    );
-    await query(
-      `INSERT INTO scrape_history (slug, ads_count, slot) VALUES ($1, $2, NULL)`,
-      [slug, countNum]
-    );
+    await saveExtensionInitial(slug, countNum);
     inicial = countNum;
     console.log(`[DESCOBERTA] slug=${slug} inicial=${countNum} salvo via Extensão (Sem Playwright)`);
   } else {
@@ -954,34 +1302,28 @@ app.post("/api/salvar", async (req, res) => {
 });
 
 app.get("/api/coletar/:slug", async (req, res) => {
-  if (isRunning) return res.status(409).type("text/plain").send("OCUPADO");
-  isRunning = true;
   const { slug } = req.params;
+  let lease;
   try {
+    lease = await acquireScrapeLease("manual_individual");
+    if (!lease) return res.status(409).type("text/plain").send("OCUPADO");
     const { rows } = await query("SELECT * FROM pages WHERE slug = $1 LIMIT 1", [slug]);
     const row = rows[0];
     if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
-    const count = await scrapeAdCount(row.url);
-    if (count === null) return res.status(502).type("text/plain").send("FALHA");
-    res.type("text/plain").send(String(count));
-    await query(
-      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE
-         SET ads_count    = EXCLUDED.ads_count,
-             collected_at = EXCLUDED.collected_at`,
-      [slug, count]
+    const [result] = await processBatch(
+      [{ slug: row.slug, nome: row.nome, url: row.url }],
+      null,
+      null,
+      null,
+      { source: "manual_individual", lease },
     );
-    console.log(`[LATEST] slug=${slug} count=${count} (manual via /api/coletar — histórico preservado)`);
-    
-    // FIX: coleta manual bem-sucedida também limpa o estado de falha em pages,
-    // senão o dashboard continua exibindo "tentou ... falhou" com o dado já atualizado.
-    await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = 'ok', last_error = NULL WHERE slug = $1`, [slug]);
+    if (result.count === null) return res.status(502).type("text/plain").send("FALHA");
+    return res.type("text/plain").send(String(result.count));
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
-    res.status(500).type("text/plain").send("FALHA");
+    return res.status(500).type("text/plain").send("FALHA");
   } finally {
-    isRunning = false;
+    if (lease) await lease.release();
   }
 });
 
@@ -1006,18 +1348,24 @@ function fingerprintManualPages(pages) {
 
 function addManualCheckResult(result) {
   const sucesso = result.count !== null && !result.dbError;
-  manualCheckStatus.resultados.push({
+  const resultado = {
     slug: result.slug,
     nome: result.nome,
     count: sucesso ? result.count : null,
     status: result.status || (sucesso ? "ok" : "falha_execucao"),
     falha: sucesso ? null : manualCheckFailureMessage(result.status),
-  });
+  };
+  const results = [...manualCheckStatus.resultados];
+  const previousIndex = results.findIndex((item) => item.slug === result.slug);
+  if (previousIndex === -1) results.push(resultado);
+  else results[previousIndex] = resultado;
+  const sucessoCount = results.filter((item) => item.count !== null).length;
   manualCheckStatus = {
     ...manualCheckStatus,
-    concluidos: manualCheckStatus.concluidos + 1,
-    sucesso: manualCheckStatus.sucesso + (sucesso ? 1 : 0),
-    falha: manualCheckStatus.falha + (sucesso ? 0 : 1),
+    resultados: results,
+    concluidos: results.length,
+    sucesso: sucessoCount,
+    falha: results.length - sucessoCount,
     atual: result.nome,
   };
 }
@@ -1066,11 +1414,17 @@ async function startManualCheck(req, res) {
     }
     return res.status(202).json({ status: "started", runId: previousRequest.runId, escopo: previousRequest.escopo });
   }
-  if (isRunning) {
+  let lease;
+  try {
+    lease = await acquireScrapeLease("manual_lote");
+  } catch (err) {
+    console.error(`[RUN] não foi possível reservar worker: ${err.message}`);
+    return res.status(503).json({ status: "error", message: "Não foi possível iniciar a checagem. Tente novamente." });
+  }
+  if (!lease) {
     return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
   }
 
-  isRunning = true;
   let pages;
   try {
     const result = selectedSlugs
@@ -1078,17 +1432,17 @@ async function startManualCheck(req, res) {
       : await query("SELECT slug, nome, url FROM pages ORDER BY tipo, nome");
     pages = result.rows;
   } catch (err) {
-    isRunning = false;
+    await lease.release();
     console.error(`[RUN] não foi possível carregar bibliotecas: ${err.message}`);
     return res.status(500).json({ status: "error", message: "Não foi possível carregar as bibliotecas." });
   }
 
   if (selectedSlugs && pages.length !== selectedSlugs.length) {
-    isRunning = false;
+    await lease.release();
     return res.status(400).json({ status: "invalid_selection", message: "Uma ou mais bibliotecas selecionadas não existem." });
   }
   if (expectedSnapshotHash && (pages.length !== expectedSnapshotCount || fingerprintManualPages(pages) !== expectedSnapshotHash)) {
-    isRunning = false;
+    await lease.release();
     return res.status(409).json({ status: "selection_changed", message: "A lista de bibliotecas mudou após a confirmação. Revise a lista completa e confirme outra vez." });
   }
 
@@ -1124,40 +1478,15 @@ async function startManualCheck(req, res) {
         return;
       }
 
-      const CHUNK_SIZE = 5; // mesmo tamanho de lote usado pelo cron — navegador é reiniciado a cada lote
-      console.log(`[RUN] checagem manual iniciada — ${pages.length} bibliotecas, escopo=${manualCheckStatus.escopo}, blocos de ${CHUNK_SIZE}`);
-
-      for (let i = 0; i < pages.length; i += CHUNK_SIZE) {
-        const lote = pages.slice(i, i + CHUNK_SIZE);
-        const reportados = new Set();
-        let resultadosLote = [];
-        try {
-          resultadosLote = await processBatch(lote, null, (result) => {
-            reportados.add(result.slug);
-            addManualCheckResult(result);
-          }, (page) => {
-            manualCheckStatus = { ...manualCheckStatus, atual: page.nome };
-          });
-        } catch (err) {
-          console.error(`[RUN] falha no bloco ${Math.floor(i / CHUNK_SIZE) + 1}: ${err.message}`);
-        }
-
-        const concluidosNoLote = new Set(resultadosLote.map((result) => result.slug));
-        for (const page of lote) {
-          if (reportados.has(page.slug) || concluidosNoLote.has(page.slug)) continue;
-          const falha = "A execução do bloco foi interrompida antes da coleta.";
-          try {
-            await query(
-              `UPDATE pages SET last_attempt_at = NOW(), last_status = 'falha_execucao', last_error = $2 WHERE slug = $1`,
-              [page.slug, falha]
-            );
-          } catch (err) {
-            console.error(`[RUN] não foi possível registrar falha de slug=${page.slug}: ${err.message}`);
-          }
-          addManualCheckResult({ ...page, count: null, status: "falha_execucao", falha });
-        }
-        console.log(`[RUN] coleta-tudo progresso: ${manualCheckStatus.concluidos}/${pages.length}`);
-      }
+      const BATCH_SIZE = 5;
+      console.log(`[RUN] checagem manual iniciada — ${pages.length} bibliotecas, blocos de ${BATCH_SIZE}; retentativas somente após a primeira passagem completa`);
+      await processBatch(
+        pages,
+        null,
+        addManualCheckResult,
+        (page) => { manualCheckStatus = { ...manualCheckStatus, atual: page.nome }; },
+        { source: "manual_lote", lease },
+      );
 
       console.log(`[RUN] coleta-tudo manual finalizada — ${pages.length} páginas`);
       manualCheckStatus = {
@@ -1172,7 +1501,7 @@ async function startManualCheck(req, res) {
         erro: "Falha ao consultar ou processar as bibliotecas. Consulte os logs do serviço.",
       };
     } finally {
-      isRunning = false;
+      await lease.release();
       manualCheckStatus = {
         ...manualCheckStatus,
         atual: null,
@@ -2678,6 +3007,17 @@ app.get("/dashboard", async (_req, res) => {
       const paginas = {};
       const mon = {};
       const meta = {}; // instagram_url, geo, nicho, funil por nome
+      const slugsDoGrupo = pagesDoGrupo.map((page) => page.slug);
+      const attemptsBySlug = new Map();
+      if (slugsDoGrupo.length > 0) {
+        const { rows: attempts } = await query(`
+          SELECT DISTINCT ON (slug) slug, status, error, COALESCE(completed_at, started_at) AS checked_at
+          FROM scrape_attempts
+          WHERE slug = ANY($1)
+          ORDER BY slug, started_at DESC, id DESC
+        `, [slugsDoGrupo]);
+        for (const attempt of attempts) attemptsBySlug.set(attempt.slug, attempt);
+      }
 
       for (const p of pagesDoGrupo) {
         const { rows: hist } = await query(
@@ -2692,24 +3032,26 @@ app.get("/dashboard", async (_req, res) => {
         );
 
         const latestRow = latest[0];
-        const temDado = hist.length > 0 || !!latestRow;
-        if (!temDado) continue;
+        const latestAttempt = attemptsBySlug.get(p.slug);
 
         ultimaLeitura[p.nome] = {
-          ads:          latestRow ? latestRow.ads_count : hist[hist.length - 1].ads_count,
+          slug:          p.slug,
+          ads:          latestRow ? latestRow.ads_count : (hist.length ? hist[hist.length - 1].ads_count : null),
           url:          p.url,
           ultimaColeta: latestRow
             ? new Date(latestRow.collected_at).toISOString()
             : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
-          tentativa:    p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null,
-          status:       p.last_status || null,
-          erro:         p.last_error || null,
+          tentativa:    latestAttempt
+            ? new Date(latestAttempt.checked_at).toISOString()
+            : (p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null),
+          status:       latestAttempt?.status || p.last_status || null,
+          erro:         latestAttempt?.error || p.last_error || null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
 
         mon[p.nome] = {
-          ini: p.inicial_count ?? (hist.length ? hist[0].ads_count : (latestRow ? latestRow.ads_count : 0))
+          ini: p.inicial_count ?? (hist.length ? hist[0].ads_count : (latestRow ? latestRow.ads_count : null))
         };
 
         // Metadados para a dashboard
@@ -2732,7 +3074,7 @@ app.get("/dashboard", async (_req, res) => {
         }
       }
 
-      const slugs = pagesDoGrupo.map(p => p.slug);
+      const slugs = slugsDoGrupo;
       let histMap = {}, histDates = [];
       if (slugs.length) {
         const { rows: histAll } = await query(`
@@ -2756,7 +3098,7 @@ app.get("/dashboard", async (_req, res) => {
         histDates = [...new Set(histAll.map(r => toBrDate(r.collected_at).toISOString().slice(0, 10)))]
           .sort((a, b) => b.localeCompare(a));
       }
-      const histLibs = Object.keys(paginas).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
+      const histLibs = Object.keys(histMap).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
 
       return {
         geral: { pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon, meta },
@@ -3267,6 +3609,7 @@ const COR=["#7c6fff","#34d399","#fb7185","#fbbf24","#22d3ee","#a78bfa","#f97316"
 function med(s){const v=Object.values(s).filter(x=>!isNaN(x));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null}
 function fd(dk){const[y,m,d]=dk.split("-");return d+"/"+m}
 function fdFull(dk){const[y,m,d]=dk.split("-");return d+"/"+m+"/"+y}
+function escapeAttr(value){return String(value).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]))}
 const{pags,ultima,primeira,mon,meta}=D;
 const LP=Object.keys(pags).sort();
 const dSet=new Set();LP.forEach(p=>Object.keys(pags[p]).forEach(d=>dSet.add(d)));
@@ -3519,17 +3862,23 @@ porAds.forEach((pag,idx)=>{
     :'<span class="ig-none">—</span>';
 
   const tr=document.createElement("tr");
+  const checkAt=ultima[pag]?.tentativa||ultima[pag]?.ultimaColeta;
+  const checkStatus=ultima[pag]?.status;
+  const checkLabels={em_andamento:"em andamento",falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
+  const checkStatusHtml=checkStatus&&checkStatus!=="ok"&&checkStatus!=="ok_zero"
+    ?'<div style="color:'+(checkStatus==="em_andamento"?"#fbbf24":"#fb7185")+';font-size:10px" title="'+escapeAttr(ultima[pag]?.erro||"")+'">'+(checkLabels[checkStatus]||"falhou")+'</div>'
+    :'';
   tr.dataset.search=(pag+" "+(ultima[pag]?.url||"")+" "+(m.geo||"")+" "+(m.nicho||"")).toLowerCase();
   tr.innerHTML=
     '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
     +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
     +'<td class="hist-pin-cell" data-label="Gráfico"></td>'
     +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
-    +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
-    +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
-    +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
-    +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
-    +(ultima[pag]?.status&&ultima[pag].status.indexOf('falha_')===0&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px" title="'+String(ultima[pag].erro||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').slice(0,300)+'">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · '+({falha_timeout:'timeout/rede',falha_bloqueio:'bloqueio da Meta',falha_parse:'contador não lido',falha_url_invalida:'URL inválida',falha_scraping:'falhou'}[ultima[pag].status]||'falhou')+'</div>':'')
+    +'<td class="mono" data-label="Inicial">'+(mon[pag]?.ini==null?'—':x.ini)+'</td>'
+    +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+(ultima[pag]?.ads==null?'—':x.at)+'</td>'
+    +'<td class="last-check-cell" data-slug="'+escapeAttr(ultima[pag]?.slug||"")+'" data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
+    +(checkAt?new Date(checkAt).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
+    +checkStatusHtml
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
@@ -4002,6 +4351,7 @@ function renderManualCheck(state){
 
   if(finalizado){
     renderManualReport(state);
+    refreshLastChecks();
     try{
       const reportKey="lowticket-manual-check-report-seen";
       if(state.runId&&sessionStorage.getItem(reportKey)!==state.runId){
@@ -4009,6 +4359,36 @@ function renderManualCheck(state){
         if(!manualReportDialog.open)manualReportDialog.showModal();
       }
     }catch(e){if(!manualReportDialog.open)manualReportDialog.showModal()}
+  }
+}
+
+async function refreshLastChecks(){
+  try{
+    const response=await fetch("/api/ultima-checagem",{cache:"no-store"});
+    if(!response.ok)throw new Error("Falha ao consultar últimas checagens");
+    const checks=await response.json();
+    const cells=new Map([...document.querySelectorAll(".last-check-cell")].map(cell=>[cell.dataset.slug,cell]));
+    const labels={em_andamento:"em andamento",falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
+    for(const check of checks){
+      const cell=cells.get(check.slug);
+      if(!cell)continue;
+      cell.replaceChildren();
+      if(check.checked_at){
+        cell.append(document.createTextNode(new Date(check.checked_at).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})));
+      }else{
+        cell.append(document.createTextNode("—"));
+      }
+      if(check.status&&check.status!=="ok"&&check.status!=="ok_zero"){
+        const state=document.createElement("div");
+        state.style.color=check.status==="em_andamento"?"#fbbf24":"#fb7185";
+        state.style.fontSize="10px";
+        state.textContent=labels[check.status]||"falhou";
+        if(check.error)state.title=check.error;
+        cell.appendChild(state);
+      }
+    }
+  }catch(err){
+    console.warn("[DASHBOARD] não foi possível atualizar últimas checagens: "+err.message);
   }
 }
 
@@ -4180,14 +4560,16 @@ async function startDashboardCheck(slugs,snapshot,requestId=crypto.randomUUID())
 manualCheckButton.addEventListener("click",openAllManualConfirmation);
 
 updateManualCheck();
+refreshLastChecks();
+setInterval(refreshLastChecks,30000);
 
 <\/script>
 </body>
 </html>`
-      .replace("__DADOS_DOM__", dadosDom)
-      .replace("__HIST_DOM__", histDadosDom)
-      .replace("__DADOS_PLACEHOLDER__", dados)
-      .replace("__HIST_PLACEHOLDER__", histDados));
+      .replace("__DADOS_DOM__", () => dadosDom)
+      .replace("__HIST_DOM__", () => histDadosDom)
+      .replace("__DADOS_PLACEHOLDER__", () => dados)
+      .replace("__HIST_PLACEHOLDER__", () => histDados));
   } catch (err) {
     res.status(500).send("Erro: " + err.message);
   }
