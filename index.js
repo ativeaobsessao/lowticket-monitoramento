@@ -3419,6 +3419,9 @@ tbody tr:hover td{background:var(--surface2)}
 .scalebar-bg{width:80px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-right:8px}
 .scalebar{height:5px;border-radius:3px;display:block}
 .spark3{font-family:'Space Mono',monospace;font-size:13px}
+.win-btn{background:transparent;color:var(--muted);border:none;border-radius:5px;padding:5px 10px;font-size:11px;font-weight:600;cursor:pointer;font-family:'Space Grotesk'}
+.win-btn.active{background:var(--accent);color:#fff}
+.win-btn:hover{color:var(--text)}
 .ig-cell{text-align:center}
 .ig-link{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;color:#e879f9;transition:background .15s}
 .ig-link:hover{background:rgba(220,39,67,.15)}
@@ -3583,6 +3586,22 @@ tbody tr:hover td{background:var(--surface2)}
 </div>
 
 <div class="section-label">📋 Resumo completo</div>
+<div id="pag_window_selector" style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+  <span style="font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.6px">Janela:</span>
+  <div style="display:flex;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:3px;gap:3px">
+    <button type="button" data-w="3" class="win-btn active">3D</button>
+    <button type="button" data-w="7" class="win-btn">7D</button>
+    <button type="button" data-w="14" class="win-btn">14D</button>
+    <button type="button" data-w="30" class="win-btn">30D</button>
+    <button type="button" data-w="custom" class="win-btn">Custom</button>
+  </div>
+  <div id="pag_custom_range" style="display:none;align-items:center;gap:6px;margin-left:8px">
+    <input type="date" id="pag_custom_start" style="background:#0f0f1e;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;padding:6px 8px">
+    <span style="color:var(--muted)">até</span>
+    <input type="date" id="pag_custom_end" style="background:#0f0f1e;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;padding:6px 8px">
+    <button type="button" id="pag_custom_apply" style="background:var(--accent);color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:11px;font-weight:600;cursor:pointer">Aplicar</button>
+  </div>
+</div>
 <div class="search-wrap">
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
   <input type="text" id="pag_busca" placeholder="Buscar por nome, URL, geo ou nicho..." oninput="filtrarTabela('pag_')">
@@ -3591,7 +3610,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Bibliotecas</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th id="pag_th_janela">3D</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
   </table>
@@ -3725,6 +3744,19 @@ ${adsPaginas.length === 0
 <script>
 const IG_SVG=${JSON.stringify(IG_SVG)};
 document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  páginas 03h · 12h · 22h · domínios 05h · palavras-chave 06h";
+let pagWindow=3;
+let pagCustom=null;
+let pagWindowCustom=false;
+try{
+  const storedWindow=localStorage.getItem("pag_window")||"3";
+  const parsedWindow=parseInt(storedWindow,10);
+  pagWindow=[3,7,14,30].includes(parsedWindow)?parsedWindow:3;
+  pagWindowCustom=storedWindow==="custom";
+  pagCustom=JSON.parse(localStorage.getItem("pag_custom")||"null");
+  if(!pagCustom||typeof pagCustom.start!=="string"||typeof pagCustom.end!=="string")pagCustom=null;
+}catch(error){
+  console.warn("Não foi possível carregar a janela salva das bibliotecas: "+error.message);
+}
 
 function toggleAccordion(bodyId,iconId){
   const body=document.getElementById(bodyId);
@@ -3766,6 +3798,112 @@ function info(pag){
   else if(vn>0){cls="b-up";label="Subindo";color="#34d399"}
   else{cls="b-down";label="Caindo";color="#fb7185"}
   return{at,ini,vn,pct,sl,cls,label,color};
+}
+function computeWindowStats(pagName,windowDays,customRange){
+  let dateKeys=Object.keys(pags[pagName]||{}).sort();
+  if(customRange){
+    dateKeys=dateKeys.filter(dk=>dk>=customRange.start&&dk<=customRange.end);
+  }else{
+    dateKeys=dateKeys.slice(-windowDays);
+  }
+  const serie=dateKeys.map(dk=>med(pags[pagName][dk])).filter(value=>value!==null);
+  if(serie.length<2)return{pct:0,delta:0,slope:0,label:"Estável",cls:"b-flat",serie,primeiro:serie[0]??0,ultimo:serie[0]??0};
+  const n=serie.length;
+  const firstChunk=serie.slice(0,Math.max(1,Math.floor(n*0.3)));
+  const lastChunk=serie.slice(Math.floor(n*0.7));
+  const primeiro=firstChunk.reduce((sum,value)=>sum+value,0)/firstChunk.length;
+  const ultimo=lastChunk.reduce((sum,value)=>sum+value,0)/lastChunk.length;
+  const delta=ultimo-primeiro;
+  const pct=primeiro>0?(delta/primeiro)*100:0;
+  const sumX=(n*(n-1))/2;
+  const sumX2=(n*(n-1)*(2*n-1))/6;
+  const sumY=serie.reduce((sum,value)=>sum+value,0);
+  const sumXY=serie.reduce((sum,value,index)=>sum+index*value,0);
+  const denominator=n*sumX2-sumX*sumX;
+  const slope=denominator?(n*sumXY-sumX*sumY)/denominator:0;
+  const at=ultima[pagName]?.ads??0;
+  let label="Estável",cls="b-flat";
+  if(at===0){label="Inativo";cls="b-off"}
+  else if(pct>50&&slope>0){label="Escalando forte";cls="b-hot"}
+  else if(pct>15&&slope>0){label="Crescendo";cls="b-up"}
+  else if(delta>0){label="Subindo";cls="b-up"}
+  else if(Math.abs(pct)<=5){label="Estável";cls="b-flat"}
+  else if(delta<0&&pct>-15){label="Caindo";cls="b-down"}
+  else if(pct<-15&&slope<0){label="Cortando";cls="b-down"}
+  return{pct,delta,slope,label,cls,serie,primeiro,ultimo};
+}
+function windowLabel(){
+  return pagWindowCustom?"CUSTOM":pagWindow+"D";
+}
+function windowTrendHtml(stats){
+  return'<span class="badge '+stats.cls+'">'+stats.label+'</span>';
+}
+function windowValueHtml(stats){
+  if(stats.delta>0)return'<span style="color:#34d399">▲ sub</span> <small style="color:var(--muted)">+'+Math.round(stats.pct)+'%</small>';
+  if(stats.delta<0)return'<span style="color:#fb7185">▼ cai</span> <small style="color:var(--muted)">'+Math.round(stats.pct)+'%</small>';
+  return'<span style="color:var(--muted)">= est</span>';
+}
+function updateResumoBibliotecas(){
+  if(P!=="pag_")return;
+  const header=document.getElementById("pag_th_janela");
+  if(header)header.textContent=windowLabel();
+  document.querySelectorAll("#pag_tbody tr").forEach(function(row){
+    const pagName=row.dataset.pagName;
+    if(!pagName)return;
+    const stats=computeWindowStats(pagName,pagWindow,pagWindowCustom?pagCustom:null);
+    const trendCell=row.querySelector("[data-role='pag-window-trend']");
+    const windowCell=row.querySelector("[data-role='pag-window-value']");
+    if(trendCell)trendCell.innerHTML=windowTrendHtml(stats);
+    if(windowCell){
+      windowCell.innerHTML=windowValueHtml(stats);
+      windowCell.dataset.label=windowLabel();
+    }
+  });
+  const selector=document.getElementById("pag_window_selector");
+  if(!selector)return;
+  selector.querySelectorAll(".win-btn").forEach(function(button){
+    button.classList.toggle("active",button.dataset.w===(pagWindowCustom?"custom":String(pagWindow)));
+  });
+  const range=document.getElementById("pag_custom_range");
+  if(range)range.style.display=pagWindowCustom?"flex":"none";
+  if(pagCustom){
+    document.getElementById("pag_custom_start").value=pagCustom.start;
+    document.getElementById("pag_custom_end").value=pagCustom.end;
+  }
+}
+function setupResumoBibliotecas(){
+  if(P!=="pag_")return;
+  const selector=document.getElementById("pag_window_selector");
+  if(!selector)return;
+  selector.querySelectorAll(".win-btn").forEach(function(button){
+    button.addEventListener("click",function(){
+      if(button.dataset.w==="custom"){
+        pagWindowCustom=true;
+        try{localStorage.setItem("pag_window","custom")}catch(error){console.warn("Não foi possível salvar a janela das bibliotecas: "+error.message)}
+      }else{
+        pagWindow=parseInt(button.dataset.w,10);
+        pagWindowCustom=false;
+        try{localStorage.setItem("pag_window",String(pagWindow))}catch(error){console.warn("Não foi possível salvar a janela das bibliotecas: "+error.message)}
+      }
+      updateResumoBibliotecas();
+    });
+  });
+  document.getElementById("pag_custom_apply").addEventListener("click",function(){
+    const start=document.getElementById("pag_custom_start").value;
+    const end=document.getElementById("pag_custom_end").value;
+    if(!start||!end||start>end){
+      window.alert("Selecione um intervalo válido: a data inicial deve ser anterior ou igual à data final.");
+      return;
+    }
+    pagCustom={start,end};
+    pagWindowCustom=true;
+    try{
+      localStorage.setItem("pag_custom",JSON.stringify(pagCustom));
+      localStorage.setItem("pag_window","custom");
+    }catch(error){console.warn("Não foi possível salvar o intervalo personalizado das bibliotecas: "+error.message)}
+    updateResumoBibliotecas();
+  });
+  console.log("[DASHBOARD] seletor janela pag_ pronto, Instagram mantido em bibliotecas");
 }
 
 const porAds=[...LP].sort((a,b)=>(ultima[b]?.ads||0)-(ultima[a]?.ads||0));
@@ -3970,6 +4108,7 @@ if(escalando.length===0){
 const tbody=document.getElementById(P+"tbody");
 porAds.forEach((pag,idx)=>{
   const x=info(pag);
+  const pagWindowStats=P==="pag_"?computeWindowStats(pag,pagWindow,pagWindowCustom?pagCustom:null):null;
   const did=primeira[pag]?fdFull(primeira[pag]):"—";
   const s=serie(pag).filter(v=>v!==null);
   const last3=s.slice(-3);
@@ -3991,6 +4130,7 @@ porAds.forEach((pag,idx)=>{
     :'';
 
   const tr=document.createElement("tr");
+  if(P==="pag_")tr.dataset.pagName=pag;
   const checkAt=ultima[pag]?.tentativa||ultima[pag]?.ultimaColeta;
   const checkStatus=ultima[pag]?.status;
   const checkLabels={em_andamento:"em andamento",falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
@@ -3998,6 +4138,12 @@ porAds.forEach((pag,idx)=>{
     ?'<div style="color:'+(checkStatus==="em_andamento"?"#fbbf24":"#fb7185")+';font-size:10px" title="'+escapeAttr(ultima[pag]?.erro||"")+'">'+(checkLabels[checkStatus]||"falhou")+'</div>'
     :'';
   tr.dataset.search=(pag+" "+(ultima[pag]?.url||"")+" "+(m.geo||"")+" "+(m.nicho||"")).toLowerCase();
+  const trendCell=P==="pag_"
+    ?'<td data-label="Tendência" data-role="pag-window-trend">'+windowTrendHtml(pagWindowStats)+'</td>'
+    :'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>';
+  const windowCell=P==="pag_"
+    ?'<td class="spark3" data-label="'+windowLabel()+'" data-role="pag-window-value">'+windowValueHtml(pagWindowStats)+'</td>'
+    :'<td class="spark3" data-label="3 dias">'+spark3+'</td>';
   tr.innerHTML=
     '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
     +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
@@ -4010,9 +4156,9 @@ porAds.forEach((pag,idx)=>{
     +checkStatusHtml
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
-    +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
+    +trendCell
     +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
-    +'<td class="spark3" data-label="3 dias">'+spark3+'</td>'
+    +windowCell
     +instagramCell;
   const pinButton=document.createElement("button");
   pinButton.type="button";
@@ -4023,6 +4169,10 @@ porAds.forEach((pag,idx)=>{
   tbody.appendChild(tr);
 });
 atualizarBotoesFixacao();
+if(P==="pag_"){
+  setupResumoBibliotecas();
+  updateResumoBibliotecas();
+}
 
 const ro=porAds.filter(p=>(ultima[p]?.ads||0)>0);
 const totalRo=ro.reduce((s,p)=>s+(ultima[p]?.ads||0),0);

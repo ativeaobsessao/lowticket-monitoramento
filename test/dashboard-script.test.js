@@ -19,7 +19,7 @@ test("dashboard inline script remains valid JavaScript", async () => {
 
 test("summary tables retain Instagram only for libraries", async () => {
   const source = await readFile(new URL("../index.js", import.meta.url), "utf8");
-  for (const prefix of ["pag", "dom"]) {
+  for (const prefix of ["pag", "dom", "key"]) {
     const tbodyIndex = source.indexOf(`<tbody id="${prefix}_tbody">`);
     const tableStart = source.lastIndexOf("<table", tbodyIndex);
     const tableEnd = source.indexOf("</table>", tbodyIndex);
@@ -29,17 +29,33 @@ test("summary tables retain Instagram only for libraries", async () => {
     const table = source.slice(tableStart, tableEnd + "</table>".length);
     const [, headerHtml] = table.match(/<thead><tr>([\s\S]*?)<\/tr><\/thead>/) || [];
     assert.ok(headerHtml);
-    const headers = [...headerHtml.matchAll(/<th>(.*?)<\/th>/g)].map(([, title]) => title);
+    const headers = [...headerHtml.matchAll(/<th(?:\s+[^>]*)?>(.*?)<\/th>/g)].map(([, title]) => title);
     const expected = [
-      "#", prefix === "pag" ? "Bibliotecas" : "Domínios",
+      "#", prefix === "pag" ? "Bibliotecas" : prefix === "dom" ? "Domínios" : "Palavras-chave",
       "Gráfico", "Descoberta", "Inicial", "Atual",
-      "Última Checagem", "Δ Total", "Tendência", "Participação", "3 dias",
+      "Última Checagem", "Δ Total", "Tendência", "Participação", prefix === "pag" ? "3D" : "3 dias",
       ...(prefix === "pag" ? ["Instagram"] : []),
     ];
     assert.deepEqual(headers, expected);
   }
   assert.match(source, /const instagramCell=P==="pag_"/);
   assert.match(source, /instagram_url/);
+});
+
+test("library summary has a persistent date-window selector limited to pag_", async () => {
+  const source = await readFile(new URL("../index.js", import.meta.url), "utf8");
+  const selectorIndex = source.indexOf('id="pag_window_selector"');
+  const searchIndex = source.indexOf('id="pag_busca"');
+  assert.ok(selectorIndex >= 0 && selectorIndex < searchIndex);
+  for (const value of ["3", "7", "14", "30", "custom"]) {
+    assert.ok(source.includes(`data-w="${value}"`), `window selector should include ${value}`);
+  }
+  assert.match(source, /function computeWindowStats\(pagName,windowDays,customRange\)/);
+  assert.match(source, /function updateResumoBibliotecas\(\)/);
+  assert.match(source, /localStorage\.setItem\("pag_window"/);
+  assert.match(source, /localStorage\.setItem\("pag_custom"/);
+  assert.match(source, /setupResumoBibliotecas\(\);\s*updateResumoBibliotecas\(\);/);
+  assert.match(source, /if\(P!=="pag_"\)return;/);
 });
 
 test("dashboard includes a separate keyword monitoring section and slot history", async () => {
