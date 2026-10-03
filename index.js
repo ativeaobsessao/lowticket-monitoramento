@@ -3332,12 +3332,13 @@ app.get("/dashboard", async (_req, res) => {
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
     const grupoKeywords = await processarGrupo(allPages.filter(p => p.tipo === "keyword"));
 
-    const dados       = JSON.stringify(grupoPaginas.geral);
-    const histDados   = JSON.stringify(grupoPaginas.hist);
-    const dadosDom    = JSON.stringify(grupoDominios.geral);
-    const histDadosDom = JSON.stringify(grupoDominios.hist);
-    const dadosKey    = JSON.stringify(grupoKeywords.geral);
-    const histDadosKey = JSON.stringify(grupoKeywords.hist);
+    const safe = (o) => JSON.stringify(o).replace(/</g, '\\u003c').replace(/'/g, "\\u0027").replace(/\\n/g, '\\n');
+    const dados       = safe(grupoPaginas.geral);
+    const histDados   = safe(grupoPaginas.hist);
+    const dadosDom    = safe(grupoDominios.geral);
+    const histDadosDom = safe(grupoDominios.hist);
+    const dadosKey    = safe(grupoKeywords.geral);
+    const histDadosKey = safe(grupoKeywords.hist);
     const IG_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor"/></svg>';
 
     // "📢 Mapeamento ADS": lê todo nó tipo='ads', conectado ou não, agrupado por página.
@@ -4594,12 +4595,13 @@ function filtrarTabela(P){
   if(msg)msg.style.display=visiveis===0?"block":"none";
 }
 
-const D_DOM=__DADOS_DOM__;
-const HD_DOM=__HIST_DOM__;
-const D_KEY=__DADOS_KEY__;
-const HD_KEY=__HIST_KEY__;
-const D_PAG=__DADOS_PLACEHOLDER__;
-const HD_PAG=__HIST_PLACEHOLDER__;
+const D_DOM=JSON.parse('__DADOS_DOM__');
+const HD_DOM=JSON.parse('__HIST_DOM__');
+const D_KEY=JSON.parse('__DADOS_KEY__');
+const HD_KEY=JSON.parse('__HIST_KEY__');
+const D_PAG=JSON.parse('__DADOS_PLACEHOLDER__');
+const HD_PAG=JSON.parse('__HIST_PLACEHOLDER__');
+
 
 const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length+Object.keys(D_KEY.pags).length;
 document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_KEY.pags).length+" palavras-chave · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
