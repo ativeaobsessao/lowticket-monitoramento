@@ -88,3 +88,23 @@ export function getBusinessSlot(now = new Date()) {
     businessDate: businessDate.toISOString().slice(0, 10),
   };
 }
+
+export function getBusinessSlotForDomain(now = new Date()) {
+  const brt = new Date(now.getTime() - BRT_OFFSET_MS);
+  if (brt.getUTCHours() !== 5) return null;
+
+  return {
+    slot: 5,
+    businessDate: brt.toISOString().slice(0, 10),
+  };
+}
+
+export function getBusinessSlotForKeyword(now = new Date()) {
+  const brt = new Date(now.getTime() - BRT_OFFSET_MS);
+  if (brt.getUTCHours() !== 6) return null;
+
+  return {
+    slot: 6,
+    businessDate: brt.toISOString().slice(0, 10),
+  };
+}

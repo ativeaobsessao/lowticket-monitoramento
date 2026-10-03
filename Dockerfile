@@ -2,18 +2,14 @@ FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json ./
+# Install the exact dependency versions recorded in the lockfile.
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# Install dependencies
-RUN npm install
-
-# Install Playwright browsers
-RUN npx playwright install chromium
-
-# Copy source
-ARG CACHEBUST=16
+# Copy application source.
 COPY index.js ./src/index.js
+COPY scrape-orchestration.js ./src/scrape-orchestration.js
+COPY monitoring-input.js ./src/monitoring-input.js
 
 # Expose port
 EXPOSE 3000

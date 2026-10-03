@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   getBusinessSlot,
+  getBusinessSlotForDomain,
+  getBusinessSlotForKeyword,
   processWithRetries,
   withTimeout,
 } from "../scrape-orchestration.js";
@@ -138,4 +140,30 @@ test("maps the three scheduled windows in BRT", () => {
     slot: 22,
     businessDate: "2026-10-03",
   });
+});
+
+test("schedules domains only during the 05:00 BRT hour", () => {
+  assert.equal(getBusinessSlotForDomain(new Date("2026-10-03T07:59:00.000Z")), null);
+  assert.deepEqual(getBusinessSlotForDomain(new Date("2026-10-03T08:00:00.000Z")), {
+    slot: 5,
+    businessDate: "2026-10-03",
+  });
+  assert.deepEqual(getBusinessSlotForDomain(new Date("2026-10-03T08:59:00.000Z")), {
+    slot: 5,
+    businessDate: "2026-10-03",
+  });
+  assert.equal(getBusinessSlotForDomain(new Date("2026-10-03T09:00:00.000Z")), null);
+});
+
+test("schedules keywords only during the 06:00 BRT hour", () => {
+  assert.equal(getBusinessSlotForKeyword(new Date("2026-10-03T08:59:00.000Z")), null);
+  assert.deepEqual(getBusinessSlotForKeyword(new Date("2026-10-03T09:00:00.000Z")), {
+    slot: 6,
+    businessDate: "2026-10-03",
+  });
+  assert.deepEqual(getBusinessSlotForKeyword(new Date("2026-10-03T09:59:00.000Z")), {
+    slot: 6,
+    businessDate: "2026-10-03",
+  });
+  assert.equal(getBusinessSlotForKeyword(new Date("2026-10-03T10:00:00.000Z")), null);
 });

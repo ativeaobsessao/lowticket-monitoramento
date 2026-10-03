@@ -4,7 +4,18 @@ import { chromium } from "playwright";
 import { execSync } from "child_process";
 import { createHash, randomUUID } from "node:crypto";
 import pg from "pg";
-import { getBusinessSlot, processWithRetries, withTimeout } from "./scrape-orchestration.js";
+import {
+  getBusinessSlot,
+  getBusinessSlotForDomain,
+  getBusinessSlotForKeyword,
+  processWithRetries,
+  withTimeout,
+} from "./scrape-orchestration.js";
+import {
+  buildKeywordSearchUrl,
+  normalizeMonitoringType,
+  parseBatchLine,
+} from "./monitoring-input.js";
 
 const { Pool } = pg;
 const app = express();
@@ -82,6 +93,7 @@ function resolveMetaUrl(raw, tipo) {
   if (!limpo) return null;
   const comEsquema = normalizeUrl(limpo);
   if (isMetaLibraryUrl(comEsquema)) return comEsquema;
+  if (tipo === "keyword") return buildKeywordSearchUrl(limpo);
   if (tipo === "dominio") {
     const dominio = limpo
       .replace(/^https?:\/\//i, "")
@@ -194,6 +206,29 @@ async function initDb() {
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS geo TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS funil TEXT`);
+  await query(`
+    DO $$
+    DECLARE
+      c_name text;
+    BEGIN
+      FOR c_name IN
+        SELECT c.conname
+        FROM pg_constraint c
+        JOIN pg_attribute a
+          ON a.attrelid = c.conrelid
+         AND a.attname = 'tipo'
+        WHERE c.conrelid = 'pages'::regclass
+          AND c.contype = 'c'
+          AND a.attnum = ANY(c.conkey)
+      LOOP
+        EXECUTE format('ALTER TABLE pages DROP CONSTRAINT %I', c_name);
+      END LOOP;
+    END $$;
+  `);
+  await query(`
+    ALTER TABLE pages ADD CONSTRAINT pages_tipo_check
+    CHECK (tipo IN ('pagina', 'dominio', 'keyword'))
+  `);
 
   // FIX (fila travada / starvation do cron): coluna que registra a última tentativa
   // de coleta de cada página, sucesso OU falha. Sem isso, uma página com falha
@@ -255,7 +290,7 @@ async function initDb() {
     CHECK (tipo IN ('ads','advertorial','presell','tsl','vsl','quiz','whatsapp','checkout'))
   `);
 
-  console.log("[DB] Tables ready.");
+  console.log("[DB] Tabelas ready");
 }
 
 
@@ -688,52 +723,20 @@ function parseLoteInput(texto) {
   const linhas = texto.split("\n").map((l) => l.trim()).filter(Boolean);
   const itens = [];
   for (const linha of linhas) {
-    const partes = linha.split("|").map((s) => s.trim()).filter(Boolean);
-    let nome, url, tipoForcado = null, instagram_url = null;
-
-    if (partes.length >= 2) {
-      const possivelTipo = partes[0].toLowerCase();
-      if (possivelTipo === "dominio" || possivelTipo === "pagina") {
-        // tipo | Nome | URL [| Instagram]
-        tipoForcado = possivelTipo;
-        nome = partes[1];
-        // Verifica se o último campo é uma URL do Instagram
-        const ultimo = partes[partes.length - 1];
-        if (partes.length >= 4 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
-          instagram_url = ultimo;
-          url = partes.slice(2, partes.length - 1).join("|");
-        } else {
-          url = partes.slice(2).join("|");
-        }
-      } else {
-        // Nome | URL [| Instagram]
-        nome = partes[0];
-        const ultimo = partes[partes.length - 1];
-        if (partes.length >= 3 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
-          instagram_url = ultimo;
-          url = partes.slice(1, partes.length - 1).join("|");
-        } else {
-          url = partes.slice(1).join("|");
-        }
-      }
-    } else {
-      continue; // linha sem "|" ou vazia — ignora
-    }
-
-        if (!nome || !url) continue;
-    const tipo = tipoForcado || (url.includes("view_all_page_id=") ? "pagina" : "dominio");
-    const urlValida = resolveMetaUrl(url, tipo);
+    const item = parseBatchLine(linha);
+    if (!item?.nome || !item.url) continue;
+    const urlValida = resolveMetaUrl(item.url, item.tipo);
     if (!urlValida) {
-      console.warn(`[LOTE] linha ignorada, URL inválida para "${nome}": ${url}`);
+      console.warn(`[LOTE] linha ignorada, URL inválida para "${item.nome}": ${item.url}`);
       continue;
     }
-    itens.push({ nome, url: urlValida, tipo, instagram_url });
+    itens.push({ ...item, url: urlValida });
   }
   return itens;
 }
 
-function getCurrentSlot() {
-  return getBusinessSlot();
+function getCurrentSlot(now = new Date()) {
+  return getBusinessSlot(now);
 }
 
 async function withScrapeLease(lease, callback) {
@@ -1158,6 +1161,16 @@ app.get("/api/cron/tick", async (req, res) => {
   res.json({ status: "alive", message: "Tick received" });
   let lease;
   try {
+    const now = new Date();
+    const brtHour = new Date(now.getTime() - 3 * 60 * 60 * 1000).getUTCHours();
+    const mode = brtHour >= 5 && brtHour < 6
+      ? "dominio"
+      : brtHour >= 6 && brtHour < 7
+        ? "keyword"
+        : "pagina";
+    const isScheduledSearchMode = mode !== "pagina";
+    console.log(`[TICK] modo ${mode} identificado`);
+
     const { rows: cooldownRows } = await query(
       `SELECT blocked_until FROM scrape_worker_lease WHERE lease_key = $1`,
       [SCRAPE_LEASE_KEY],
@@ -1165,7 +1178,7 @@ app.get("/api/cron/tick", async (req, res) => {
     const blockedUntil = cooldownRows[0]?.blocked_until
       ? new Date(cooldownRows[0].blocked_until)
       : null;
-    if (blockedUntil && blockedUntil.getTime() > Date.now()) {
+    if (!isScheduledSearchMode && blockedUntil && blockedUntil.getTime() > Date.now()) {
       console.warn(`[TICK] ignorado durante cooldown até ${blockedUntil.toISOString()}`);
       return;
     }
@@ -1180,31 +1193,79 @@ app.get("/api/cron/tick", async (req, res) => {
       return;
     }
 
-    const slotInfo = getCurrentSlot();
-    const { rows: pages } = await query(`
-      SELECT p.slug, p.nome, p.url
-      FROM pages p
-      WHERE NOT EXISTS (
-        SELECT 1 FROM scrape_history sh 
-        WHERE sh.slug = p.slug 
-          AND sh.slot = $1
-          AND sh.business_date = $2
-      )
-      ORDER BY p.last_attempt_at ASC NULLS FIRST
-      LIMIT 5;
-    `, [slotInfo.slot, slotInfo.businessDate]);
+    const slotInfo = mode === "dominio"
+      ? getBusinessSlotForDomain(now)
+      : mode === "keyword"
+        ? getBusinessSlotForKeyword(now)
+        : getCurrentSlot(now);
+    const { rows: pages } = mode === "dominio"
+      ? await query(`
+          SELECT p.slug, p.nome, p.url
+          FROM pages p
+          WHERE p.tipo = 'dominio'
+            AND NOT EXISTS (
+              SELECT 1 FROM scrape_history sh
+              WHERE sh.slug = p.slug
+                AND sh.slot = 5
+                AND sh.business_date = $1
+            )
+          ORDER BY p.last_attempt_at ASC NULLS FIRST
+          LIMIT 5;
+        `, [slotInfo.businessDate])
+      : mode === "keyword"
+        ? await query(`
+            SELECT p.slug, p.nome, p.url
+            FROM pages p
+            WHERE p.tipo = 'keyword'
+              AND NOT EXISTS (
+                SELECT 1 FROM scrape_history sh
+                WHERE sh.slug = p.slug
+                  AND sh.slot = 6
+                  AND sh.business_date = $1
+              )
+            ORDER BY p.last_attempt_at ASC NULLS FIRST
+            LIMIT 5;
+          `, [slotInfo.businessDate])
+        : await query(`
+          SELECT p.slug, p.nome, p.url
+          FROM pages p
+          WHERE p.tipo = 'pagina'
+            AND NOT EXISTS (
+              SELECT 1 FROM scrape_history sh
+              WHERE sh.slug = p.slug
+                AND sh.slot = $1
+                AND sh.business_date = $2
+            )
+          ORDER BY p.last_attempt_at ASC NULLS FIRST
+          LIMIT 5;
+        `, [slotInfo.slot, slotInfo.businessDate]);
 
     if (pages.length === 0) {
-      console.log(`[TICK] nenhuma biblioteca pendente para slot=${slotInfo.slot} date=${slotInfo.businessDate}`);
+      console.log(
+        mode === "dominio"
+          ? `[TICK-DOMINIO] nenhum domínio pendente para slot=5 date=${slotInfo.businessDate}`
+          : mode === "keyword"
+            ? `[TICK-KEYWORD] nenhuma palavra-chave pendente para slot=6 date=${slotInfo.businessDate}`
+            : `[TICK] nenhuma biblioteca pendente para slot=${slotInfo.slot} date=${slotInfo.businessDate}`,
+      );
       return;
     }
 
-    console.log(`[TICK] Iniciando lote de ${pages.length} páginas para slot=${slotInfo.slot} date=${slotInfo.businessDate}...`);
-    const results = await processBatch(pages, slotInfo, null, null, { source: "cron", lease });
+    console.log(
+      mode === "dominio"
+        ? `[TICK-DOMINIO] Iniciando lote de domínios para slot=5 date=${slotInfo.businessDate}`
+        : mode === "keyword"
+          ? `[TICK-KEYWORD] Iniciando lote de palavras-chave para slot=6 date=${slotInfo.businessDate}`
+          : `[TICK] Iniciando lote de ${pages.length} páginas para slot=${slotInfo.slot} date=${slotInfo.businessDate}...`,
+    );
+    const results = await processBatch(pages, slotInfo, null, null, {
+      source: mode === "dominio" ? "cron_dominio" : mode === "keyword" ? "cron_keyword" : "cron",
+      lease,
+    });
     const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
     const metaRes = results.filter(r => metaSlugs.has(r.slug));
     const FALHAS_TECNICAS = ["falha_bloqueio", "falha_timeout", "falha_parse"];
-    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError && FALHAS_TECNICAS.includes(r.status))) {
+    if (mode === "pagina" && metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError && FALHAS_TECNICAS.includes(r.status))) {
       const { rows } = await query(
         `UPDATE scrape_worker_lease
          SET blocked_until = NOW() + INTERVAL '90 minutes'
@@ -1272,9 +1333,9 @@ app.post("/api/salvar", async (req, res) => {
   if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
     const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
-  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const tipoFinal = normalizeMonitoringType(tipo) || "pagina";
   const url = resolveMetaUrl(urlRaw, tipoFinal);
-  if (!url) return res.status(400).json({ error: "URL inválida: informe a URL da Meta Ad Library (facebook.com/ads/library) ou, para tipo dominio, apenas o domínio." });
+  if (!url) return res.status(400).json({ error: "Entrada inválida: informe a URL da Meta Ad Library, um domínio ou uma palavra-chave conforme o tipo selecionado." });
   await query(
     `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -1590,7 +1651,7 @@ app.get("/admin", async (_req, res) => {
 
   const lista = pages.map(p => `
     <tr data-search="${escAttr((p.nome + " " + p.url + " " + (p.geo||"") + " " + (p.nicho||"")).toLowerCase())}">
-      <td><span class="badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐 Domínio" : "📡 Biblioteca"}</span></td>
+      <td><span class="badge ${p.tipo === "dominio" ? "b-dom" : p.tipo === "keyword" ? "b-key" : "b-pag"}">${p.tipo === "dominio" ? "🌐 Domínio" : p.tipo === "keyword" ? "🔑 Palavra-chave" : "📡 Biblioteca"}</span></td>
       <td class="nome-cell">
         <div class="nome">${p.nome}</div>
         <div class="meta-badges">
@@ -1629,7 +1690,7 @@ app.get("/admin", async (_req, res) => {
     if (q.ok === "removido") return '<div class="msg ok">🗑️ Rastreamento removido.</div>';
     if (q.erro === "campos-obrigatorios") return '<div class="msg err">⚠️ Nome e URL são obrigatórios.</div>';
     if (q.erro === "nome-invalido") return '<div class="msg err">⚠️ Nome inválido.</div>';
-    if (q.erro === "url-invalida") return '<div class="msg err">⚠️ URL inválida. Use a URL da Meta Ad Library (facebook.com/ads/library) ou, para Domínio, apenas o domínio (ex: site.com).</div>';
+    if (q.erro === "url-invalida") return '<div class="msg err">⚠️ Entrada inválida. Use a URL da Meta Ad Library, um domínio ou uma palavra-chave conforme o tipo selecionado.</div>';
     if (q.erro === "lote-vazio") return '<div class="msg err">⚠️ Nenhum item enviado no lote.</div>';
     if (q.erro === "lote-invalido") return '<div class="msg err">⚠️ Nenhuma linha válida encontrada no lote.</div>';
     if (q.erro === "lote-em-andamento") return '<div class="msg err">⚠️ Já existe um lote em andamento. Aguarde terminar.</div>';
@@ -1685,6 +1746,7 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 .url-link:hover{text-decoration:underline}
 .badge{display:inline-block;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:600}
 .b-dom{background:rgba(124,111,255,.15);color:#a78bfa}
+.b-key{background:rgba(251,191,36,.14);color:#fbbf24}
 .b-pag{background:rgba(52,211,153,.12);color:#34d399}
 .msg{padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:18px}
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
@@ -1744,6 +1806,7 @@ ${msgOk}
         <select name="tipo" id="tipoSelect" onchange="atualizarDica()">
           <option value="pagina">📡 Biblioteca (página)</option>
           <option value="dominio">🌐 Domínio (URL)</option>
+          <option value="keyword">🔑 Palavra-chave</option>
         </select>
       </div>
       <div class="field">
@@ -1751,7 +1814,7 @@ ${msgOk}
         <input type="text" name="nome" id="nomeInput" placeholder="Ex: FlowForce Max ou FLOWFORCE.COM" required>
       </div>
       <div class="field">
-        <label>URL da Meta Ad Library</label>
+        <label id="urlLabel">URL da Meta Ad Library</label>
         <input type="text" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
       </div>
     </div>
@@ -1800,8 +1863,10 @@ ${msgOk}
       💡 Formatos aceitos por linha:<br>
       <code>Nome | URL da Meta Ad Library</code><br>
       <code>Nome | URL da Meta Ad Library | https://instagram.com/perfil</code><br>
-      <code>tipo | Nome | URL | https://instagram.com/perfil</code><br><br>
-      O tipo (Biblioteca ou Domínio) é detectado automaticamente pela URL. O Instagram é opcional — basta omitir.<br>
+      <code>tipo | Nome | URL | https://instagram.com/perfil</code><br>
+      <code>keyword | Jejum Intermitente</code><br>
+      <code>palavra | Jejum | URL da Meta Ad Library</code><br><br>
+      O tipo (Biblioteca, Domínio ou Palavra-chave) é detectado automaticamente pela URL quando possível. O Instagram é opcional — basta omitir.<br>
       Geo e Nicho só podem ser preenchidos após o cadastro, editando o item individualmente no admin.<br>
       Cada item leva ~15-20s pra processar. A página não precisa ficar aberta.
     </div>
@@ -1834,11 +1899,18 @@ function atualizarDica(){
   const tipo=document.getElementById('tipoSelect').value;
   const dica=document.getElementById('dica');
   const url=document.getElementById('urlInput');
+  const urlLabel=document.getElementById('urlLabel');
   if(tipo==='dominio'){
     dica.innerHTML='💡 <strong>Domínio:</strong> Cole a URL de busca por palavra-chave/domínio na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM&search_type=keyword_unordered</code>';
+    urlLabel.textContent='URL da Meta Ad Library ou domínio';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM...';
+  }else if(tipo==='keyword'){
+    dica.textContent="💡 Palavra-chave: Digite apenas a palavra ou frase. O sistema monta a busca na Biblioteca automaticamente. Ex: 'ansiedade' vira busca por todos os anúncios ativos com essa palavra.";
+    urlLabel.textContent='Palavra-chave ou URL da Meta Ad Library';
+    url.placeholder='Ex: jejum intermitente, biblia explicada, ansiedade';
   }else{
     dica.innerHTML='💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library com filtro "Anúncios ativos".<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>';
+    urlLabel.textContent='URL da Meta Ad Library';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&id=...';
   }
 }
@@ -1935,7 +2007,7 @@ function confirmarRemoverAdminFinal(){
 app.post("/admin/salvar", async (req, res) => {
     const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
   if (!nome || !urlRaw) return res.redirect("/admin?erro=campos-obrigatorios");
-  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  const tipoFinal = normalizeMonitoringType(tipo) || "pagina";
   const url = resolveMetaUrl(urlRaw, tipoFinal);
   if (!url) return res.redirect("/admin?erro=url-invalida");
 
@@ -2901,7 +2973,7 @@ app.get("/funis", async (_req, res) => {
   const cardsHtml = comMapa.map(p => `
     <div class="player-card">
       <div class="player-hdr">
-        <span class="player-tipo-badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐" : "📡"}</span>
+        <span class="player-tipo-badge ${p.tipo === "dominio" ? "b-dom" : p.tipo === "keyword" ? "b-key" : "b-pag"}">${p.tipo === "dominio" ? "🌐" : p.tipo === "keyword" ? "🔑" : "📡"}</span>
         <a href="${p.url}" target="_blank" rel="noopener" class="player-nome">${p.nome}</a>
         <a href="/admin/funis/${p.slug}" class="player-edit-link">✏️ Editar</a>
       </div>
@@ -2914,7 +2986,7 @@ app.get("/funis", async (_req, res) => {
     <div class="card" style="margin-top:8px">
       <h2>💤 Sem funil mapeado ainda (${semMapa.length})</h2>
       <div class="sem-mapa-list">
-        ${semMapa.map(p => `<a href="/admin/funis/${p.slug}" class="sem-mapa-item">${p.tipo === "dominio" ? "🌐" : "📡"} ${p.nome}</a>`).join("")}
+        ${semMapa.map(p => `<a href="/admin/funis/${p.slug}" class="sem-mapa-item">${p.tipo === "dominio" ? "🌐" : p.tipo === "keyword" ? "🔑" : "📡"} ${p.nome}</a>`).join("")}
       </div>
     </div>` : "";
 
@@ -2987,9 +3059,6 @@ ${semMapaHtml}
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
-// SVG da logo do Instagram (inline, sem dependência externa)
-const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ig" x1="0" y1="24" x2="24" y2="0"><stop offset="0%" stop-color="#f09433"/><stop offset="25%" stop-color="#e6683c"/><stop offset="50%" stop-color="#dc2743"/><stop offset="75%" stop-color="#cc2366"/><stop offset="100%" stop-color="#bc1888"/></linearGradient></defs><rect width="24" height="24" rx="6" fill="url(#ig)"/><rect x="3" y="3" width="18" height="18" rx="5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="12" cy="12" r="4.5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="17.5" cy="6.5" r="1.2" fill="white"/></svg>`;
-
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
@@ -3006,7 +3075,7 @@ app.get("/dashboard", async (_req, res) => {
       const primeiraData = {};
       const paginas = {};
       const mon = {};
-      const meta = {}; // instagram_url, geo, nicho, funil por nome
+      const meta = {}; // geo, nicho, funil por nome
       const slugsDoGrupo = pagesDoGrupo.map((page) => page.slug);
       const attemptsBySlug = new Map();
       if (slugsDoGrupo.length > 0) {
@@ -3066,9 +3135,10 @@ app.get("/dashboard", async (_req, res) => {
         for (const h of hist) {
           const brDt = toBrDate(h.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
+          const legacySlots = p.tipo === "keyword" ? [6] : p.tipo === "dominio" ? [3, 5, 12, 22] : [3, 12, 22];
           const slot = (h.slot !== null && h.slot !== undefined)
             ? Number(h.slot)
-            : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
+            : legacySlots.reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, legacySlots[0]);
           if (!paginas[p.nome][dk]) paginas[p.nome][dk] = {};
           paginas[p.nome][dk][slot] = h.ads_count;
         }
@@ -3078,7 +3148,7 @@ app.get("/dashboard", async (_req, res) => {
       let histMap = {}, histDates = [];
       if (slugs.length) {
         const { rows: histAll } = await query(`
-          SELECT p.nome, sh.ads_count, sh.slot, sh.collected_at
+          SELECT p.nome, p.tipo, sh.ads_count, sh.slot, sh.collected_at
           FROM scrape_history sh
           JOIN pages p ON p.slug = sh.slug
           WHERE sh.slug = ANY($1) AND sh.collected_at >= NOW() - INTERVAL '60 days'
@@ -3088,9 +3158,10 @@ app.get("/dashboard", async (_req, res) => {
           const nome = r.nome;
           const brDt = toBrDate(r.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
+          const legacySlots = r.tipo === "keyword" ? [6] : r.tipo === "dominio" ? [3, 5, 12, 22] : [3, 12, 22];
           const slot = (r.slot !== null && r.slot !== undefined)
             ? Number(r.slot)
-            : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
+            : legacySlots.reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, legacySlots[0]);
           if (!histMap[nome]) histMap[nome] = {};
           if (!histMap[nome][dk]) histMap[nome][dk] = {};
           if (histMap[nome][dk][slot] === undefined) histMap[nome][dk][slot] = r.ads_count;
@@ -3107,13 +3178,17 @@ app.get("/dashboard", async (_req, res) => {
       };
     }
 
-    const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
+    const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo === "pagina"));
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
+    const grupoKeywords = await processarGrupo(allPages.filter(p => p.tipo === "keyword"));
 
     const dados       = JSON.stringify(grupoPaginas.geral);
     const histDados   = JSON.stringify(grupoPaginas.hist);
     const dadosDom    = JSON.stringify(grupoDominios.geral);
     const histDadosDom = JSON.stringify(grupoDominios.hist);
+    const dadosKey    = JSON.stringify(grupoKeywords.geral);
+    const histDadosKey = JSON.stringify(grupoKeywords.hist);
+    const IG_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor"/></svg>';
 
     // "📢 Mapeamento ADS": lê todo nó tipo='ads', conectado ou não, agrupado por página.
     // Não depende de computarCaminhos() (que exige componente com 2+ nós) — um ADS
@@ -3136,7 +3211,7 @@ app.get("/dashboard", async (_req, res) => {
     const adsCardsHtml = adsPaginas.map(pg => `
       <div class="player-card">
         <div class="player-hdr">
-          <span class="player-tipo-badge ${pg.tipo === "dominio" ? "b-dom" : "b-pag"}">${pg.tipo === "dominio" ? "🌐" : "📡"}</span>
+          <span class="player-tipo-badge ${pg.tipo === "dominio" ? "b-dom" : pg.tipo === "keyword" ? "b-key" : "b-pag"}">${pg.tipo === "dominio" ? "🌐" : pg.tipo === "keyword" ? "🔑" : "📡"}</span>
           <span class="player-nome">${pg.nome}</span>
           <span class="ads-count-badge">📢 ${pg.itens.length} ADS</span>
         </div>
@@ -3145,9 +3220,6 @@ app.get("/dashboard", async (_req, res) => {
         </div>
       </div>
     `).join("");
-
-    // Serializa o SVG do Instagram para uso seguro dentro do template literal JS
-    const IG_SVG_ESC = IG_SVG.replace(/`/g, "\\`").replace(/\$/g, "\\$");
 
     res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
@@ -3190,7 +3262,7 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .manual-selection-search{width:100%;height:100%;border:0;outline:0;background:transparent;color:#20252a;font:13px 'Space Grotesk',sans-serif}
 .manual-selection-search-wrap:focus-within{border-color:#397c4b;box-shadow:0 0 0 3px rgba(57,124,75,.16)}
 .manual-selection-search::placeholder{color:#9098a1}
-.selection-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.selection-groups{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
 .selection-group{min-width:0;border:1px solid #dfe2e5;border-radius:12px;background:#fff;overflow:hidden}
 .selection-group>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 15px;border-bottom:1px solid #eceef0}
 .selection-group>header>div{display:flex;align-items:center;gap:10px;min-width:0}
@@ -3254,7 +3326,10 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .manual-report-open:hover{text-decoration:underline}
 .manual-run-panel{margin:0 0 20px;padding:14px 16px;background:rgba(255,255,255,.035);border:1px solid var(--border);border-radius:12px}
 .manual-run-panel[hidden]{display:none}
-.manual-run-head{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px}
+.manual-run-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;font-size:12px}
+.manual-run-dismiss{flex:0 0 auto;width:30px;height:30px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--text2);font-size:20px;line-height:1;cursor:pointer}
+.manual-run-dismiss:hover{border-color:var(--down);color:var(--down)}
+.manual-run-dismiss[hidden]{display:none}
 .manual-run-title{font-weight:600;color:var(--text)}
 .manual-run-summary,.manual-run-current{color:var(--muted);font-size:11px;margin-top:4px}
 .manual-run-count{color:var(--text2);font:11px 'Space Mono',monospace;white-space:nowrap}
@@ -3345,7 +3420,7 @@ tbody tr:hover td{background:var(--surface2)}
 .scalebar{height:5px;border-radius:3px;display:block}
 .spark3{font-family:'Space Mono',monospace;font-size:13px}
 .ig-cell{text-align:center}
-.ig-link{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;transition:background .15s}
+.ig-link{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;color:#e879f9;transition:background .15s}
 .ig-link:hover{background:rgba(220,39,67,.15)}
 .ig-none{color:var(--muted);font-size:13px}
 .mono{font-family:'Space Mono',monospace}
@@ -3362,6 +3437,7 @@ tbody tr:hover td{background:var(--surface2)}
 .player-tipo-badge{font-size:15px;padding:2px 6px;border-radius:6px}
 .player-nome{font-size:15px;font-weight:700;color:#fff;text-decoration:none}
 .b-dom{background:rgba(124,111,255,.15);color:#a78bfa}
+.b-key{background:rgba(251,191,36,.14);color:#fbbf24}
 .b-pag{background:rgba(52,211,153,.12);color:#34d399}
 .chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff}
 .chip:hover{border-color:var(--accent)}
@@ -3409,7 +3485,7 @@ tbody tr:hover td{background:var(--surface2)}
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
     <div class="hdr-live" style="margin-left:0"><span class="dot"></span><span id="livecount"></span></div>
     <div style="display:flex;gap:8px">
-      <button type="button" class="manual-check-btn" id="manual-check-button" title="Conferir todas as bibliotecas monitoradas">
+      <button type="button" class="manual-check-btn" id="manual-check-button" title="Conferir todos os itens monitorados">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 1-2.34-5.66L20 7"/></svg>
         <span id="manual-check-label">Checar todas</span>
       </button>
@@ -3429,7 +3505,10 @@ tbody tr:hover td{background:var(--surface2)}
       <div class="manual-run-title" id="manual-run-title">Checagem manual</div>
       <div class="manual-run-current" id="manual-run-current" role="status" aria-live="polite"></div>
     </div>
-    <div class="manual-run-count" id="manual-run-count"></div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <div class="manual-run-count" id="manual-run-count"></div>
+      <button type="button" class="manual-run-dismiss" id="manual-run-dismiss" aria-label="Fechar relatório e quadro de checagem" title="Fechar relatório e quadro de checagem" hidden>×</button>
+    </div>
   </div>
   <div class="manual-run-track" role="progressbar" aria-label="Progresso da checagem" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="manual-run-progress"></span></div>
   <div class="manual-run-results" id="manual-run-results"></div>
@@ -3453,6 +3532,10 @@ tbody tr:hover td{background:var(--surface2)}
           <header><div><span class="selection-group-icon selection-group-icon-url">U</span><h3 id="manual-urls-title">URLs Monitoradas</h3></div><span class="selection-group-count" id="manual-urls-count">0</span></header>
           <div class="manual-selection-list" id="manual-urls-list" role="group" aria-label="URLs monitoradas"><div class="selection-empty">Carregando URLs...</div></div>
         </section>
+        <section class="selection-group" aria-labelledby="manual-keywords-title">
+          <header><div><span class="selection-group-icon">K</span><h3 id="manual-keywords-title">Palavras-chave</h3></div><span class="selection-group-count" id="manual-keywords-count">0</span></header>
+          <div class="manual-selection-list" id="manual-keywords-list" role="group" aria-label="Palavras-chave monitoradas"><div class="selection-empty">Carregando palavras-chave...</div></div>
+        </section>
       </div>
     </div>
     <footer class="selection-dialog-footer"><span class="manual-selection-message" id="manual-selection-message">Nenhum item selecionado</span><div><button type="button" class="dialog-secondary" id="manual-selection-cancel">Cancelar</button><button type="button" class="dialog-primary" id="manual-check-selected" disabled>Realizar checagem</button></div></footer>
@@ -3470,11 +3553,11 @@ tbody tr:hover td{background:var(--surface2)}
 
 <dialog class="report-dialog" id="manual-report-dialog" aria-labelledby="manual-report-title" aria-describedby="manual-report-subtitle manual-report-status">
   <div class="report-dialog-shell">
-    <header class="report-head"><div><div class="dialog-eyebrow">LOWTICKET MONITOR · RESULTADO</div><h2 id="manual-report-title">Relatório da checagem</h2><p id="manual-report-subtitle"></p></div><button type="button" class="dialog-close" id="manual-report-close" aria-label="Fechar relatório">×</button></header>
+    <header class="report-head"><div><div class="dialog-eyebrow">LOWTICKET MONITOR · RESULTADO</div><h2 id="manual-report-title">Relatório da checagem</h2><p id="manual-report-subtitle"></p></div><button type="button" class="dialog-close" id="manual-report-close" aria-label="Fechar relatório e quadro de checagem">×</button></header>
     <div class="report-status" id="manual-report-status"></div>
     <div class="report-metrics" id="manual-report-metrics"></div>
-    <section class="report-results-section"><header><h3>Resultado por biblioteca</h3><span id="manual-report-results-count"></span></header><div class="report-results" id="manual-report-results"></div></section>
-    <footer class="report-footer"><span id="manual-report-timestamp"></span><div><button type="button" class="dialog-secondary" id="manual-report-dismiss">Fechar</button><button type="button" class="dialog-primary" id="manual-report-refresh">Atualizar dashboard</button></div></footer>
+    <section class="report-results-section"><header><h3>Resultado por item monitorado</h3><span id="manual-report-results-count"></span></header><div class="report-results" id="manual-report-results"></div></section>
+    <footer class="report-footer"><span id="manual-report-timestamp"></span><div><button type="button" class="dialog-secondary" id="manual-report-dismiss">Fechar definitivamente</button><button type="button" class="dialog-primary" id="manual-report-refresh">Atualizar dashboard</button></div></footer>
   </div>
 </dialog>
 
@@ -3547,7 +3630,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Domínios</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
   </table>
@@ -3556,7 +3639,45 @@ tbody tr:hover td{background:var(--surface2)}
 
 <div style="height:36px"></div>
 
-<div class="group-title">🔀 Mapeamento de Funis</div>
+  <div class="group-title">🔑 PALAVRAS-CHAVE — rastreio por keyword</div>
+  <div class="section-label">🚀 Escalando agora — palavras-chave em ascensão</div>
+  <div class="scaling-strip" id="key_scaling"></div>
+  <div class="empty-hint" id="key_scaling-empty" style="display:none">Nenhuma palavra-chave em ascensão.</div>
+
+  <div class="grid-charts">
+    <div class="panel">
+      <div class="panel-title">🍩 Distribuição atual</div>
+      <div class="rosca-wrap">
+        <div class="rosca-canvas"><canvas id="key_cRosca"></canvas></div>
+        <div class="legend" id="key_legend"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+      <div class="hist-selection" id="key_hist-selection" hidden><span id="key_hist-status" aria-live="polite"></span><button class="hist-reset" id="key_hist-reset" type="button">Restaurar padrão</button></div>
+      <div class="hist-box"><canvas id="key_cHist"></canvas></div>
+    </div>
+  </div>
+
+  <div class="section-label">📋 Resumo completo</div>
+  <div class="search-wrap">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>
+    <input type="text" id="key_busca" placeholder="Buscar por palavra-chave, URL, geo ou nicho..." oninput="filtrarTabela('key_')">
+  </div>
+  <div class="tbl-panel">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Palavras-chave</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+        <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
+      </tr></thead>
+      <tbody id="key_tbody"></tbody>
+    </table>
+    <div class="empty-hint" id="key_busca-vazio" style="display:none;margin:0;border:none;border-top:1px solid var(--border);border-radius:0">Nenhum resultado encontrado.</div>
+  </div>
+
+  <div style="height:36px"></div>
+
+  <div class="group-title">🔀 Mapeamento de Funis</div>
 <div class="empty-hint" style="display:flex;align-items:center;justify-content:center;gap:14px">
   <span>O mapeamento completo de funis agora tem uma página dedicada.</span>
   <a href="/funis" style="font-size:13px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:8px 18px;border-radius:8px;white-space:nowrap">🔀 Abrir Mapa de Funis</a>
@@ -3585,17 +3706,25 @@ ${adsPaginas.length === 0
 
 <div class="accordion-wrap" style="margin-top:12px">
   <button class="accordion-btn" onclick="toggleAccordion('dom_hist-section','dom_acc-icon')">
-    <span>🌐 Histórico de Coletas — Domínios · 03h · 12h · 22h</span>
+    <span>🌐 Histórico de Coletas — Domínios · 03h · 05h · 12h · 22h</span>
     <span class="acc-meta" id="dom_acc-meta"></span>
     <span class="acc-icon" id="dom_acc-icon">▼</span>
   </button>
   <div class="accordion-body" id="dom_hist-section">Carregando histórico...</div>
 </div>
 
-<script>
-const IG_SVG=\`${IG_SVG_ESC}\`;
+<div class="accordion-wrap" style="margin-top:12px">
+  <button class="accordion-btn" onclick="toggleAccordion('key_hist-section','key_acc-icon')">
+    <span>🔑 Histórico de Coletas — Palavras-chave · 06h</span>
+    <span class="acc-meta" id="key_acc-meta"></span>
+    <span class="acc-icon" id="key_acc-icon">▼</span>
+  </button>
+  <div class="accordion-body" id="key_hist-section">Carregando histórico...</div>
+</div>
 
-document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  coletas 03h · 12h · 22h";
+<script>
+const IG_SVG=${JSON.stringify(IG_SVG)};
+document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  páginas 03h · 12h · 22h · domínios 05h · palavras-chave 06h";
 
 function toggleAccordion(bodyId,iconId){
   const body=document.getElementById(bodyId);
@@ -3855,11 +3984,11 @@ porAds.forEach((pag,idx)=>{
   const funilBadge=m.funil?'<span class="t-funil-badge">🎯 '+m.funil+'</span>':'';
   const metaBadgesHtml=(geoBadge||nichoBadge||funilBadge)?'<div class="t-meta-badges">'+geoBadge+nichoBadge+funilBadge+'</div>':'';
   const nomeCell='<span class="t-name-main"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></span>'+metaBadgesHtml;
-
-  // Célula do Instagram
-  const igCell=m.instagram_url
-    ?'<a href="'+m.instagram_url+'" target="_blank" rel="noopener" class="ig-link" title="Ver Instagram">'+IG_SVG+'</a>'
-    :'<span class="ig-none">—</span>';
+  const instagramCell=P==="pag_"
+    ?'<td class="ig-cell" data-label="Instagram">'+(m.instagram_url
+      ?'<a href="'+escapeAttr(m.instagram_url)+'" target="_blank" rel="noopener noreferrer" class="ig-link" title="Ver Instagram">'+IG_SVG+'</a>'
+      :'<span class="ig-none">—</span>')+'</td>'
+    :'';
 
   const tr=document.createElement("tr");
   const checkAt=ultima[pag]?.tentativa||ultima[pag]?.ultimaColeta;
@@ -3884,7 +4013,7 @@ porAds.forEach((pag,idx)=>{
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
     +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
     +'<td class="spark3" data-label="3 dias">'+spark3+'</td>'
-    +'<td class="ig-cell" data-label="Instagram">'+igCell+'</td>';
+    +instagramCell;
   const pinButton=document.createElement("button");
   pinButton.type="button";
   pinButton.className="hist-pin-btn";
@@ -3939,12 +4068,11 @@ if(!HD.dates.length||!HD.libs.length){
     if(v===undefined||v===null)return '<span class="hist-slot empty">—</span>';
     return '<span class="hist-slot">'+v+'</span>';
   }
+  const historySlots=P==="dom_"?[3,5,12,22]:P==="key_"?[6]:[3,12,22];
   let thead='<thead><tr>'
     +'<th style="text-align:left;white-space:nowrap">Biblioteca</th>'
     +'<th style="text-align:left;white-space:nowrap">Data</th>'
-    +'<th style="text-align:center">03h</th>'
-    +'<th style="text-align:center">12h</th>'
-    +'<th style="text-align:center">22h</th>'
+    +historySlots.map(slot=>'<th style="text-align:center">'+String(slot).padStart(2,"0")+'h</th>').join("")
     +'</tr></thead>';
   let tbody2='<tbody>';
   let rowCount=0;
@@ -3953,20 +4081,18 @@ if(!HD.dates.length||!HD.libs.length){
     for(const dk of HD.dates){
       const slots=HD.map[lib]?.[dk];
       if(!slots)continue;
-      const hasAny=slots[3]!==undefined||slots[12]!==undefined||slots[22]!==undefined;
+      const hasAny=historySlots.some(slot=>slots[slot]!==undefined);
       if(!hasAny)continue;
       tbody2+='<tr>'
         +'<td class="lib-name">'+(firstForLib?lib:'')+'</td>'
         +'<td class="date-col">'+fdH(dk)+'</td>'
-        +'<td>'+slotCell(lib,dk,3)+'</td>'
-        +'<td>'+slotCell(lib,dk,12)+'</td>'
-        +'<td>'+slotCell(lib,dk,22)+'</td>'
+        +historySlots.map(slot=>'<td>'+slotCell(lib,dk,slot)+'</td>').join("")
         +'</tr>';
       firstForLib=false;
       rowCount++;
     }
     if(!firstForLib){
-      tbody2+='<tr style="height:4px;background:var(--bg)"><td colspan="5"></td></tr>';
+      tbody2+='<tr style="height:4px;background:var(--bg)"><td colspan="'+(historySlots.length+2)+'"></td></tr>';
     }
   }
   tbody2+='</tbody>';
@@ -3991,14 +4117,17 @@ function filtrarTabela(P){
 
 const D_DOM=__DADOS_DOM__;
 const HD_DOM=__HIST_DOM__;
+const D_KEY=__DADOS_KEY__;
+const HD_KEY=__HIST_KEY__;
 const D_PAG=__DADOS_PLACEHOLDER__;
 const HD_PAG=__HIST_PLACEHOLDER__;
 
-const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length;
-document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
+const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length+Object.keys(D_KEY.pags).length;
+document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_KEY.pags).length+" palavras-chave · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
 
 render(D_PAG,HD_PAG,"pag_");
 render(D_DOM,HD_DOM,"dom_");
+render(D_KEY,HD_KEY,"key_");
 
 const manualCheckButton=document.getElementById("manual-check-button");
 const manualCheckLabel=document.getElementById("manual-check-label");
@@ -4006,9 +4135,11 @@ const manualCustomizeButton=document.getElementById("manual-customize-button");
 const manualSelectionDialog=document.getElementById("manual-selection-dialog");
 const manualPagesList=document.getElementById("manual-pages-list");
 const manualUrlsList=document.getElementById("manual-urls-list");
+const manualKeywordsList=document.getElementById("manual-keywords-list");
 const manualSelectionSearch=document.getElementById("manual-selection-search");
 const manualPagesCount=document.getElementById("manual-pages-count");
 const manualUrlsCount=document.getElementById("manual-urls-count");
+const manualKeywordsCount=document.getElementById("manual-keywords-count");
 const manualSelectionMessage=document.getElementById("manual-selection-message");
 const manualCheckSelectedButton=document.getElementById("manual-check-selected");
 const manualConfirmDialog=document.getElementById("manual-confirm-dialog");
@@ -4021,6 +4152,7 @@ const manualRunPanel=document.getElementById("manual-run-panel");
 const manualRunTitle=document.getElementById("manual-run-title");
 const manualRunCurrent=document.getElementById("manual-run-current");
 const manualRunCount=document.getElementById("manual-run-count");
+const manualRunDismiss=document.getElementById("manual-run-dismiss");
 const manualRunProgress=document.getElementById("manual-run-progress");
 const manualRunTrack=manualRunProgress.parentElement;
 const manualRunResults=document.getElementById("manual-run-results");
@@ -4032,6 +4164,8 @@ const manualReportMetrics=document.getElementById("manual-report-metrics");
 const manualReportResultsCount=document.getElementById("manual-report-results-count");
 const manualReportResults=document.getElementById("manual-report-results");
 const manualReportTimestamp=document.getElementById("manual-report-timestamp");
+const MANUAL_REPORT_DISMISSED_KEY="lowticket-manual-check-dismissed-run";
+let dismissedManualRunId=null;
 const manualStatusLabels={
   ok:"Conferida",
   ok_zero:"0 anúncios",
@@ -4052,6 +4186,7 @@ let pendingManualSlugs=[];
 let pendingManualSnapshot=[];
 let pendingManualRun=null;
 let manualRequestTrackingId=null;
+let manualDisplayedRunId=null;
 let manualRetryTimer=null;
 const MANUAL_SELECTION_LIMIT=500;
 
@@ -4080,8 +4215,9 @@ function updateManualSelectionCount(){
 function renderManualSelection(pages){
   manualPages=[...pages].sort((a,b)=>a.nome.localeCompare(b.nome,"pt-BR"));
   const groups=[
-    {items:manualPages.filter(page=>page.tipo!=="dominio"),list:manualPagesList,count:manualPagesCount,empty:"Nenhuma página monitorada cadastrada."},
+    {items:manualPages.filter(page=>page.tipo==="pagina"),list:manualPagesList,count:manualPagesCount,empty:"Nenhuma página monitorada cadastrada."},
     {items:manualPages.filter(page=>page.tipo==="dominio"),list:manualUrlsList,count:manualUrlsCount,empty:"Nenhuma URL monitorada cadastrada."},
+    {items:manualPages.filter(page=>page.tipo==="keyword"),list:manualKeywordsList,count:manualKeywordsCount,empty:"Nenhuma palavra-chave monitorada cadastrada."},
   ];
   for(const group of groups){
     group.list.replaceChildren();
@@ -4129,7 +4265,7 @@ async function loadManualSelection(force=false){
     renderManualSelection(pages);
   }catch(e){
     manualSelectionLoaded=false;
-    for(const list of [manualPagesList,manualUrlsList]){
+    for(const list of [manualPagesList,manualUrlsList,manualKeywordsList]){
       const error=document.createElement("div");
       error.className="selection-empty";
       error.textContent="Falha ao carregar a lista. Feche e abra para tentar novamente.";
@@ -4158,12 +4294,18 @@ function openManualConfirmation(slugs,scope){
   if(!selected.length)return;
   pendingManualSlugs=scope==="todas"?null:selected.map(page=>page.slug);
   pendingManualSnapshot=selected.map(page=>({slug:page.slug,nome:page.nome,url:page.url}));
-  const pages=selected.filter(page=>page.tipo!=="dominio");
+  const pages=selected.filter(page=>page.tipo==="pagina");
   const urls=selected.filter(page=>page.tipo==="dominio");
+  const keywords=selected.filter(page=>page.tipo==="keyword");
   manualConfirmTitle.textContent=scope==="todas"?"Confirmar checagem de todas?":"Confirmar checagem personalizada?";
   manualConfirmDescription.textContent=scope==="todas"?"Serão checadas todas as "+selected.length+" bibliotecas monitoradas. Revise a lista completa antes de iniciar.":"A checagem vai consultar exatamente estes "+selected.length+" itens. Revise nomes e URLs antes de iniciar.";
   manualConfirmSummary.replaceChildren();
-  for(const label of [selected.length+" selecionado"+(selected.length===1?"":"s"),pages.length+" página"+(pages.length===1?"":"s"),urls.length+" URL"+(urls.length===1?"":"s")]){
+  for(const label of [
+    selected.length+" selecionado"+(selected.length===1?"":"s"),
+    pages.length+" página"+(pages.length===1?"":"s"),
+    urls.length+" URL"+(urls.length===1?"":"s"),
+    keywords.length+" palavra-chave"+(keywords.length===1?"":"s"),
+  ]){
     const badge=document.createElement("span");
     badge.textContent=label;
     manualConfirmSummary.appendChild(badge);
@@ -4173,7 +4315,7 @@ function openManualConfirmation(slugs,scope){
     const row=document.createElement("div");
     row.className="confirm-selection-item";
     const name=document.createElement("strong");
-    name.textContent=(page.tipo==="dominio"?"URL monitorada · ":"Página monitorada · ")+page.nome;
+    name.textContent=(page.tipo==="dominio"?"URL monitorada · ":page.tipo==="keyword"?"Palavra-chave monitorada · ":"Página monitorada · ")+page.nome;
     const url=document.createElement("code");
     url.textContent=page.url;
     row.append(name,url);
@@ -4195,8 +4337,8 @@ async function openAllManualConfirmation(){
   manualCheckLabel.textContent="Preparando...";
   try{
     await loadManualSelection(true);
-    if(!manualSelectionLoaded)throw new Error("Não foi possível carregar as bibliotecas. Tente novamente.");
-    if(!manualPages.length)throw new Error("Nenhuma biblioteca monitorada está cadastrada.");
+    if(!manualSelectionLoaded)throw new Error("Não foi possível carregar os itens monitorados. Tente novamente.");
+    if(!manualPages.length)throw new Error("Nenhum item monitorado está cadastrado.");
     openManualConfirmation(null,"todas");
   }catch(error){
     manualRunPanel.hidden=false;
@@ -4294,8 +4436,26 @@ function renderManualReport(state){
 manualReportOpen.addEventListener("click",function(){
   if(!manualReportDialog.open)manualReportDialog.showModal();
 });
-document.getElementById("manual-report-close").addEventListener("click",function(){manualReportDialog.close()});
-document.getElementById("manual-report-dismiss").addEventListener("click",function(){manualReportDialog.close()});
+function dismissManualReport(runId){
+  if(runId){
+    dismissedManualRunId=runId;
+    try{
+      localStorage.setItem(MANUAL_REPORT_DISMISSED_KEY,runId);
+    }catch(error){
+      console.warn("Não foi possível salvar a dispensa do relatório neste navegador: "+error.message);
+    }
+  }
+  manualReportDialog.close();
+  manualRunPanel.hidden=true;
+  manualReportOpen.hidden=true;
+}
+manualRunDismiss.addEventListener("click",function(){dismissManualReport(manualDisplayedRunId||manualRequestTrackingId)});
+document.getElementById("manual-report-close").addEventListener("click",function(){dismissManualReport(manualDisplayedRunId||manualRequestTrackingId)});
+document.getElementById("manual-report-dismiss").addEventListener("click",function(){dismissManualReport(manualDisplayedRunId||manualRequestTrackingId)});
+manualReportDialog.addEventListener("cancel",function(event){
+  event.preventDefault();
+  dismissManualReport(manualDisplayedRunId||manualRequestTrackingId);
+});
 document.getElementById("manual-report-refresh").addEventListener("click",function(){
   manualReportDialog.close();
   window.location.reload();
@@ -4305,6 +4465,7 @@ function renderManualCheck(state){
   const estaRodando=state.status==="running";
   const finalizado=state.status==="completed"||state.status==="completed_with_errors"||state.status==="failed";
   const ocupadoSemRelatorio=state.ocupado&&!estaRodando&&!finalizado;
+  if(state.runId)manualDisplayedRunId=state.runId;
   manualCheckButton.disabled=estaRodando||state.ocupado;
   manualCustomizeButton.disabled=estaRodando||state.ocupado;
   manualCheckLabel.textContent=estaRodando?"Conferindo...":"Checar todas";
@@ -4312,7 +4473,23 @@ function renderManualCheck(state){
   if(state.status==="idle"&&!state.ocupado){
     manualRunPanel.hidden=true;
     manualReportOpen.hidden=true;
+    manualRunDismiss.hidden=true;
     return;
+  }
+  if(finalizado&&state.runId){
+    let dismissedRunId=dismissedManualRunId;
+    try{
+      dismissedRunId=localStorage.getItem(MANUAL_REPORT_DISMISSED_KEY)||dismissedRunId;
+    }catch(error){
+      console.warn("Não foi possível consultar a dispensa salva do relatório: "+error.message);
+    }
+    if(dismissedRunId===state.runId){
+      manualRunPanel.hidden=true;
+      manualReportOpen.hidden=true;
+      manualRunDismiss.hidden=true;
+      if(manualReportDialog.open)manualReportDialog.close();
+      return;
+    }
   }
   manualRunPanel.hidden=false;
   if(ocupadoSemRelatorio){
@@ -4326,13 +4503,14 @@ function renderManualCheck(state){
   }
 
   const progresso=state.total?Math.round((state.concluidos/state.total)*100):0;
-  manualRunTitle.textContent=state.status==="running"?(state.escopo==="selecionadas"?"Conferindo selecionadas":"Conferindo bibliotecas"):state.status==="completed"?"Checagem concluída":state.status==="failed"?"Não foi possível concluir a checagem":"Checagem concluída com falhas";
+  manualRunTitle.textContent=state.status==="running"?(state.escopo==="selecionadas"?"Conferindo selecionadas":"Conferindo itens monitorados"):state.status==="completed"?"Checagem concluída":state.status==="failed"?"Não foi possível concluir a checagem":"Checagem concluída com falhas";
   manualRunCurrent.textContent=state.status==="running"?(state.atual?"Conferindo: "+state.atual:"Preparando coleta..."):(state.erro||"Resultado atualizado na dashboard.");
   manualRunCount.textContent=state.concluidos+" / "+state.total+" · "+state.sucesso+" ok · "+state.falha+" falhas";
   manualRunProgress.style.width=progresso+"%";
   manualRunTrack.setAttribute("aria-valuenow",String(progresso));
   manualRunResults.replaceChildren();
   manualReportOpen.hidden=!finalizado;
+  manualRunDismiss.hidden=!finalizado;
   for(const item of state.resultados||[]){
     const row=document.createElement("div");
     row.className="manual-run-row";
@@ -4537,7 +4715,7 @@ async function startDashboardCheck(slugs,snapshot,requestId=crypto.randomUUID())
     pendingManualRun=null;
     manualRunPanel.hidden=false;
     manualRunTitle.textContent="Iniciando checagem";
-    manualRunCurrent.textContent=slugs?"Preparando as bibliotecas selecionadas...":"Preparando as bibliotecas monitoradas...";
+    manualRunCurrent.textContent=slugs?"Preparando os itens selecionados...":"Preparando os itens monitorados...";
     setTimeout(updateManualCheck,500);
   }catch(e){
     if(requestMayHaveStarted){
@@ -4568,6 +4746,8 @@ setInterval(refreshLastChecks,30000);
 </html>`
       .replace("__DADOS_DOM__", () => dadosDom)
       .replace("__HIST_DOM__", () => histDadosDom)
+      .replace("__DADOS_KEY__", () => dadosKey)
+      .replace("__HIST_KEY__", () => histDadosKey)
       .replace("__DADOS_PLACEHOLDER__", () => dados)
       .replace("__HIST_PLACEHOLDER__", () => histDados));
   } catch (err) {

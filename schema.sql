@@ -1,6 +1,6 @@
 -- ============================================================================
 -- SCHEMA — MONITORAMENTO DE META ADS & MAPEAMENTO DE FUNIS (VIVA Labs / lowticket)
--- Compatível com PostgreSQL / NEON / Render
+-- Compatível com PostgreSQL / Supabase
 -- ============================================================================
 -- Snapshot do schema tal como é criado/mantido por initDb() em index.js.
 -- Reflete o estado ATUAL do código: 7 tabelas. Este sistema NÃO possui a
@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS pages (
   slug          TEXT PRIMARY KEY,
   nome          TEXT NOT NULL,
   url           TEXT NOT NULL,
-  tipo          TEXT NOT NULL DEFAULT 'pagina', -- 'pagina' (Biblioteca de Anúncios) ou 'dominio'
+  tipo          TEXT NOT NULL DEFAULT 'pagina'
+                CHECK (tipo IN ('pagina', 'dominio', 'keyword')), -- Tipo de rastreamento
   inicial_count INTEGER,                        -- Quantidade inicial de anúncios capturada no cadastro
   instagram_url TEXT,                           -- URL do perfil do Instagram
   geo           TEXT,                           -- Região/País de atuação
@@ -43,7 +44,7 @@ CREATE TABLE IF NOT EXISTS scrape_history (
   id           SERIAL PRIMARY KEY,
   slug         TEXT NOT NULL,
   ads_count    INTEGER NOT NULL,
-  slot         SMALLINT,                        -- Slot do cron (3=03h, 12=12h, 22=22h); NULL sem slot automático
+  slot         SMALLINT,                        -- Bibliotecas: 3/12/22; domínios: 5; keywords: 6; NULL sem slot automático
   business_date DATE,                           -- Data BRT da janela, slot 22 cruza a meia-noite
   collected_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
