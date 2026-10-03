@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildKeywordSearchUrl,
   inferMonitoringType,
+  normalizeKeywordIdentity,
   parseBatchLine,
 } from "../monitoring-input.js";
 
@@ -11,6 +12,13 @@ test("builds a Meta keyword search URL from a phrase", () => {
     buildKeywordSearchUrl("jejum intermitente"),
     "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=jejum%20intermitente&search_type=keyword_unordered",
   );
+});
+
+test("normalizes keyword identities without merging accents or word order", () => {
+  assert.equal(normalizeKeywordIdentity("  JEJUM   Intermitente "), "jejum intermitente");
+  assert.equal(normalizeKeywordIdentity("coração"), "coração");
+  assert.notEqual(normalizeKeywordIdentity("coração"), normalizeKeywordIdentity("coracao"));
+  assert.equal(normalizeKeywordIdentity("   "), null);
 });
 
 test("recognizes keyword searches and keeps domain searches classified as domains", () => {

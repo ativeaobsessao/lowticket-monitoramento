@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS pages (
   url           TEXT NOT NULL,
   tipo          TEXT NOT NULL DEFAULT 'pagina'
                 CHECK (tipo IN ('pagina', 'dominio', 'keyword')), -- Tipo de rastreamento
+  keyword_key   TEXT,                           -- Identidade normalizada exclusiva das palavras-chave
   inicial_count INTEGER,                        -- Quantidade inicial de anúncios capturada no cadastro
   instagram_url TEXT,                           -- URL do perfil do Instagram
   geo           TEXT,                           -- Região/País de atuação
@@ -36,6 +37,11 @@ CREATE TABLE IF NOT EXISTS pages (
   last_error    TEXT,                           -- Diagnóstico da última tentativa com falha
   created_at    TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS keyword_key TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_keyword_key_unique
+  ON pages(keyword_key) WHERE tipo = 'keyword';
 
 -- ----------------------------------------------------------------------------
 -- 2. HISTÓRICO COMPLETO DE COLETAS (SCRAPINGS)

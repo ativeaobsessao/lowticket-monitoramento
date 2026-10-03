@@ -12,9 +12,18 @@ export function normalizeMonitoringType(value) {
 }
 
 export function buildKeywordSearchUrl(keyword) {
-  const cleaned = String(keyword ?? "").trim().replace(/^["'\s]+|["'\s]+$/g, "");
+  const cleaned = String(keyword ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/^["']+|["']+$/g, "");
   if (!cleaned) return null;
   return `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=${encodeURIComponent(cleaned)}&search_type=keyword_unordered`;
+}
+
+export function normalizeKeywordIdentity(keyword) {
+  const cleaned = String(keyword ?? "").normalize("NFKC").trim().replace(/\s+/g, " ");
+  return cleaned ? cleaned.toLocaleLowerCase("pt-BR") : null;
 }
 
 export function inferMonitoringType(rawUrl) {

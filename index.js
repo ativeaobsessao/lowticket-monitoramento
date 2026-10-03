@@ -13,6 +13,7 @@ import {
 } from "./scrape-orchestration.js";
 import {
   buildKeywordSearchUrl,
+  normalizeKeywordIdentity,
   normalizeMonitoringType,
   parseBatchLine,
 } from "./monitoring-input.js";
@@ -115,6 +116,7 @@ async function initDb() {
       nome          TEXT NOT NULL,
       url           TEXT NOT NULL,
       tipo          TEXT NOT NULL DEFAULT 'pagina',
+      keyword_key   TEXT,
       instagram_url TEXT,
       geo           TEXT,
       nicho         TEXT,
@@ -201,6 +203,7 @@ async function initDb() {
 
   // Migrações: garante colunas novas em banco antigo (seguro rodar sempre)
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS keyword_key TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS inicial_count INTEGER`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS instagram_url TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS geo TEXT`);
@@ -228,6 +231,39 @@ async function initDb() {
   await query(`
     ALTER TABLE pages ADD CONSTRAINT pages_tipo_check
     CHECK (tipo IN ('pagina', 'dominio', 'keyword'))
+  `);
+  await query(`
+    WITH identities AS (
+      SELECT slug,
+             COALESCE(
+               NULLIF(keyword_key, ''),
+               lower(regexp_replace(btrim(nome), '[[:space:]]+', ' ', 'g'))
+             ) AS identity,
+             row_number() OVER (
+               PARTITION BY COALESCE(
+                 NULLIF(keyword_key, ''),
+                 lower(regexp_replace(btrim(nome), '[[:space:]]+', ' ', 'g'))
+               )
+               ORDER BY slug
+             ) AS identity_rank
+      FROM pages
+      WHERE tipo = 'keyword'
+    )
+    UPDATE pages p
+    SET keyword_key = CASE
+      WHEN identities.identity_rank = 1 THEN identities.identity
+      ELSE identities.identity || '::legacy::' || identities.slug
+    END
+    FROM identities
+    WHERE p.slug = identities.slug
+      AND p.keyword_key IS DISTINCT FROM CASE
+        WHEN identities.identity_rank = 1 THEN identities.identity
+        ELSE identities.identity || '::legacy::' || identities.slug
+      END
+  `);
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_keyword_key_unique
+    ON pages(keyword_key) WHERE tipo = 'keyword'
   `);
 
   // FIX (fila travada / starvation do cron): coluna que registra a última tentativa
@@ -305,6 +341,108 @@ function toSlug(nome) {
     .replace(/[^a-z0-9-]/g, "")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+async function saveMonitoringRecord({
+  nome,
+  url,
+  tipo,
+  instagram_url = null,
+  geo = null,
+  nicho = null,
+  funil = null,
+}) {
+  const baseSlug = toSlug(nome);
+  if (!baseSlug) throw new Error("Could not generate a valid slug.");
+  const keywordKey = tipo === "keyword" ? normalizeKeywordIdentity(nome) : null;
+  if (tipo === "keyword" && !keywordKey) throw new Error("A palavra-chave não pode estar vazia.");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    if (keywordKey) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`keyword:${keywordKey}`]);
+    }
+
+    let existing;
+    if (keywordKey) {
+      const result = await client.query(
+        "SELECT slug FROM pages WHERE tipo = 'keyword' AND keyword_key = $1 FOR UPDATE",
+        [keywordKey],
+      );
+      existing = result.rows[0];
+    } else {
+      const result = await client.query(
+        "SELECT slug FROM pages WHERE slug = $1 AND tipo = $2 FOR UPDATE",
+        [baseSlug, tipo],
+      );
+      existing = result.rows[0];
+      if (!existing) {
+        const typedResult = await client.query(
+          "SELECT slug FROM pages WHERE slug = $1 AND tipo = $2 FOR UPDATE",
+          [`${tipo}-${baseSlug}`, tipo],
+        );
+        existing = typedResult.rows[0];
+      }
+    }
+
+    let slug = existing?.slug;
+    if (slug) {
+      await client.query(
+        `UPDATE pages
+         SET nome = $2, url = $3, instagram_url = COALESCE($4, instagram_url),
+             geo = COALESCE($5, geo), nicho = COALESCE($6, nicho),
+             funil = COALESCE($7, funil), keyword_key = $8
+         WHERE slug = $1`,
+        [slug, nome, url, instagram_url, geo, nicho, funil, keywordKey],
+      );
+    } else {
+      for (let suffix = 0; suffix < 1000; suffix++) {
+        const candidate = suffix === 0
+          ? baseSlug
+          : `${tipo}-${baseSlug}${suffix === 1 ? "" : `-${suffix}`}`;
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`slug:${candidate}`]);
+        const occupied = await client.query(
+          "SELECT slug, tipo, keyword_key FROM pages WHERE slug = $1 FOR UPDATE",
+          [candidate],
+        );
+        if (occupied.rowCount) {
+          const row = occupied.rows[0];
+          if (row.tipo === tipo && (tipo !== "keyword" || row.keyword_key === keywordKey)) {
+            slug = row.slug;
+            await client.query(
+              `UPDATE pages
+               SET nome = $2, url = $3, instagram_url = COALESCE($4, instagram_url),
+                   geo = COALESCE($5, geo), nicho = COALESCE($6, nicho),
+                   funil = COALESCE($7, funil), keyword_key = $8
+               WHERE slug = $1`,
+              [slug, nome, url, instagram_url, geo, nicho, funil, keywordKey],
+            );
+            break;
+          }
+          continue;
+        }
+        slug = candidate;
+        await client.query(
+          `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil, keyword_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [slug, nome, url, tipo, instagram_url, geo, nicho, funil, keywordKey],
+        );
+        break;
+      }
+      if (!slug) throw new Error("Could not allocate a unique monitoring identifier.");
+    }
+
+    await client.query("COMMIT");
+    return { slug, keyword_key: keywordKey };
+  } catch (err) {
+    await client.query("ROLLBACK").catch((rollbackError) => {
+      console.error(`[SALVAR] rollback falhou: ${rollbackError.message}`);
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 function getChromiumPath() {
@@ -607,23 +745,21 @@ async function runLote(itens) {
   try {
     const pages = [];
     for (const item of itens) {
-      const slug = toSlug(item.nome);
-      if (!slug) {
+      if (!toSlug(item.nome)) {
         loteStatus.erros.push(`"${item.nome}" — nome inválido, ignorado`);
         loteStatus.concluidos++;
         continue;
       }
       try {
-        await query(
-          `INSERT INTO pages (slug, nome, url, tipo, instagram_url)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4,
-             instagram_url = COALESCE(EXCLUDED.instagram_url, pages.instagram_url)`,
-          [slug, item.nome, item.url, item.tipo, item.instagram_url || null]
-        );
-        pages.push({ slug, nome: item.nome, url: item.url });
+        const record = await saveMonitoringRecord({
+          nome: item.nome,
+          url: item.url,
+          tipo: item.tipo,
+          instagram_url: item.instagram_url || null,
+        });
+        pages.push({ slug: record.slug, nome: item.nome, url: item.url });
       } catch (err) {
-        console.error(`[LOTE] erro no item slug=${slug}: ${err.message}`);
+        console.error(`[LOTE] erro no item "${item.nome}": ${err.message}`);
         loteStatus.erros.push(`"${item.nome}" — erro: ${err.message}`);
         loteStatus.concluidos++;
       }
@@ -1121,24 +1257,17 @@ app.get("/api/ultima-checagem", async (_req, res) => {
   try {
     const { rows } = await query(`
       SELECT p.slug,
-             CASE
-               WHEN a.checked_at IS NOT NULL
-                 AND (p.last_attempt_at IS NULL OR a.checked_at >= p.last_attempt_at)
-               THEN a.checked_at
-               ELSE COALESCE(p.last_attempt_at, l.collected_at)
-             END AS checked_at,
-             CASE
-               WHEN a.checked_at IS NOT NULL
-                 AND (p.last_attempt_at IS NULL OR a.checked_at >= p.last_attempt_at)
-               THEN a.status
-               ELSE p.last_status
-             END AS status,
-             CASE
-               WHEN a.checked_at IS NOT NULL
-                 AND (p.last_attempt_at IS NULL OR a.checked_at >= p.last_attempt_at)
-               THEN a.error
-               ELSE p.last_error
-             END AS error
+             l.collected_at AS ultima_coleta_ok,
+             jsonb_build_object(
+               'status', a.status,
+               'error', a.error,
+               'at', a.checked_at,
+               'relevante', COALESCE(
+                 a.checked_at > NOW() - INTERVAL '6 hours'
+                 AND a.status LIKE 'falha_%',
+                 FALSE
+               )
+             ) AS tentativa
       FROM pages p
       LEFT JOIN LATERAL (
         SELECT COALESCE(completed_at, started_at) AS checked_at, status, error
@@ -1331,35 +1460,49 @@ async function saveExtensionInitial(slug, count) {
 app.post("/api/salvar", async (req, res) => {
   const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
   if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
-    const slug = toSlug(nome);
-  if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = normalizeMonitoringType(tipo) || "pagina";
+  if (!toSlug(nome)) return res.status(400).json({ error: "Could not generate a valid slug." });
   const url = resolveMetaUrl(urlRaw, tipoFinal);
   if (!url) return res.status(400).json({ error: "Entrada inválida: informe a URL da Meta Ad Library, um domínio ou uma palavra-chave conforme o tipo selecionado." });
-  await query(
-    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (slug) DO UPDATE
-       SET nome=$2, url=$3, tipo=$4,
-           instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
-           geo=COALESCE(EXCLUDED.geo, pages.geo),
-           nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
-           funil=COALESCE(EXCLUDED.funil, pages.funil)`,
-    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
-  );
-  console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
+  try {
+    const record = await saveMonitoringRecord({
+      nome,
+      url,
+      tipo: tipoFinal,
+      instagram_url: instagram_url || null,
+      geo: geo || null,
+      nicho: nicho || null,
+      funil: funil || null,
+    });
+    console.log(`[SALVAR] registered slug=${record.slug} tipo=${tipoFinal}`);
 
-  let inicial = ads_count_inicial;
-  if (inicial !== undefined && inicial !== null) {
-    const countNum = parseInt(inicial, 10) || 0;
-    await saveExtensionInitial(slug, countNum);
-    inicial = countNum;
-    console.log(`[DESCOBERTA] slug=${slug} inicial=${countNum} salvo via Extensão (Sem Playwright)`);
-  } else {
-    inicial = await captureInicial(slug, url);
+    if (tipoFinal === "keyword") {
+      captureInicial(record.slug, url).catch((err) => {
+        console.error(`[DESCOBERTA] falha ao iniciar captura de keyword ${record.slug}: ${err.message}`);
+      });
+      return res.status(202).json({
+        slug: record.slug,
+        tipo: tipoFinal,
+        keyword_key: record.keyword_key,
+        inicial: null,
+        coletarPath: `/api/coletar/${record.slug}`,
+      });
+    }
+
+    let inicial = ads_count_inicial;
+    if (inicial !== undefined && inicial !== null) {
+      const countNum = parseInt(inicial, 10) || 0;
+      await saveExtensionInitial(record.slug, countNum);
+      inicial = countNum;
+      console.log(`[DESCOBERTA] slug=${record.slug} inicial=${countNum} salvo via Extensão (Sem Playwright)`);
+    } else {
+      inicial = await captureInicial(record.slug, url);
+    }
+    return res.json({ slug: record.slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${record.slug}` });
+  } catch (err) {
+    console.error(`[SALVAR] erro ao registrar tipo=${tipoFinal}: ${err.message}`);
+    return res.status(500).json({ error: "Não foi possível salvar o monitoramento." });
   }
-
-  res.json({ slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${slug}` });
 });
 
 app.get("/api/coletar/:slug", async (req, res) => {
@@ -1633,8 +1776,8 @@ app.get("/api/status", async (_req, res) => {
 });
 
 app.get("/api/paginas", async (_req, res) => {
-  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil FROM pages");
-  res.json(rows);
+  const { rows } = await query("SELECT slug, nome, url, tipo, keyword_key, instagram_url, geo, nicho, funil FROM pages");
+  res.set("Cache-Control", "no-store").json(rows);
 });
 
 // ─── Admin ───────────────────────────────────────────────────────────────────
@@ -2015,9 +2158,10 @@ app.post("/admin/salvar", async (req, res) => {
   // mesmo que o nome de exibição mude, para preservar o vínculo com scrape_history/scrape_latest.
   if (original_slug && original_slug.trim()) {
     try {
+      const keywordKey = tipoFinal === "keyword" ? normalizeKeywordIdentity(nome) : null;
       const { rowCount } = await query(
-        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7 WHERE slug=$8`,
-        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, original_slug.trim()]
+        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7, keyword_key=$8 WHERE slug=$9`,
+        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, keywordKey, original_slug.trim()]
       );
       if (rowCount === 0) {
         console.warn(`[ADMIN] edição falhou — slug=${original_slug} não encontrado`);
@@ -2032,22 +2176,19 @@ app.post("/admin/salvar", async (req, res) => {
   }
 
   // Modo cadastro (novo item)
-  const slug = toSlug(nome);
-  if (!slug) return res.redirect("/admin?erro=nome-invalido");
+  if (!toSlug(nome)) return res.redirect("/admin?erro=nome-invalido");
   try {
-    await query(
-      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (slug) DO UPDATE
-         SET nome=$2, url=$3, tipo=$4,
-             instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
-             geo=COALESCE(EXCLUDED.geo, pages.geo),
-             nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
-             funil=COALESCE(EXCLUDED.funil, pages.funil)`,
-      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
-    );
-    console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
-    await captureInicial(slug, url);
+    const record = await saveMonitoringRecord({
+      nome,
+      url,
+      tipo: tipoFinal,
+      instagram_url: instagram_url || null,
+      geo: geo || null,
+      nicho: nicho || null,
+      funil: funil || null,
+    });
+    console.log(`[ADMIN] cadastrou slug=${record.slug} tipo=${tipoFinal}`);
+    await captureInicial(record.slug, url);
     res.redirect("/admin?ok=1");
   } catch (err) {
     console.error("[ADMIN] erro:", err.message);
@@ -3062,7 +3203,7 @@ ${semMapaHtml}
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status, last_error FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -3080,7 +3221,14 @@ app.get("/dashboard", async (_req, res) => {
       const attemptsBySlug = new Map();
       if (slugsDoGrupo.length > 0) {
         const { rows: attempts } = await query(`
-          SELECT DISTINCT ON (slug) slug, status, error, COALESCE(completed_at, started_at) AS checked_at
+          SELECT DISTINCT ON (slug)
+                 slug, status, error,
+                 COALESCE(completed_at, started_at) AS checked_at,
+                 COALESCE(
+                   COALESCE(completed_at, started_at) > NOW() - INTERVAL '6 hours'
+                   AND status LIKE 'falha_%',
+                   FALSE
+                 ) AS alert_relevant
           FROM scrape_attempts
           WHERE slug = ANY($1)
           ORDER BY slug, started_at DESC, id DESC
@@ -3109,12 +3257,13 @@ app.get("/dashboard", async (_req, res) => {
           url:          p.url,
           ultimaColeta: latestRow
             ? new Date(latestRow.collected_at).toISOString()
-            : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
-          tentativa:    latestAttempt
-            ? new Date(latestAttempt.checked_at).toISOString()
-            : (p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null),
-          status:       latestAttempt?.status || p.last_status || null,
-          erro:         latestAttempt?.error || p.last_error || null,
+            : null,
+          tentativa:    latestAttempt ? {
+            status: latestAttempt.status,
+            error: latestAttempt.error,
+            at: latestAttempt.checked_at ? new Date(latestAttempt.checked_at).toISOString() : null,
+            relevante: Boolean(latestAttempt.alert_relevant),
+          } : null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
@@ -3610,7 +3759,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Bibliotecas</th><th>Gráfico</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th id="pag_th_janela">3D</th><th>Instagram</th>
+      <th>Δ Total</th><th>Tendência</th><th id="pag_th_score" tabindex="0" role="button" aria-sort="descending" title="Clique para ordenar pelo score" style="cursor:pointer">SCORE ↕</th><th>Participação</th><th id="pag_th_janela">3D</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
   </table>
@@ -3777,7 +3926,23 @@ const dSet=new Set();LP.forEach(p=>Object.keys(pags[p]).forEach(d=>dSet.add(d)))
 const datas=Array.from(dSet).sort();
 
 function serie(pag){return datas.map(dk=>pags[pag]?.[dk]?med(pags[pag][dk]):null)}
-function slope(pag){
+function slope(datas,valores){
+  if(valores.length<2||datas.length!==valores.length)return 0;
+  const rawXs=datas.map((date,index)=>{
+    const timestamp=Date.parse(date+"T00:00:00Z");
+    return Number.isFinite(timestamp)?timestamp/86400000:index;
+  });
+  const baseX=rawXs[0];
+  const xs=rawXs.map(value=>value-baseX);
+  const n=valores.length;
+  const sumX=xs.reduce((sum,value)=>sum+value,0);
+  const sumX2=xs.reduce((sum,value)=>sum+value*value,0);
+  const sumY=valores.reduce((sum,value)=>sum+value,0);
+  const sumXY=xs.reduce((sum,value,index)=>sum+value*valores[index],0);
+  const denominator=n*sumX2-sumX*sumX;
+  return denominator?(n*sumXY-sumX*sumY)/denominator:0;
+}
+function slopeHistorico(pag){
   const s=serie(pag).filter(v=>v!==null);
   if(s.length<2)return 0;
   const recent=s.slice(-3);
@@ -3788,7 +3953,7 @@ function info(pag){
   const ini=mon[pag]?.ini??at;
   const vn=at-ini;
   const pct=ini>0?Math.round(((at-ini)/ini)*100):0;
-  const sl=slope(pag);
+  const sl=slopeHistorico(pag);
   let cls,label,color;
   if(at===0){cls="b-off";label="Inativo";color=getComputedStyle(document.documentElement).getPropertyValue('--muted')}
   else if(pct>50){cls="b-hot";label="Escalando forte";color="#a78bfa"}
@@ -3832,6 +3997,71 @@ function computeWindowStats(pagName,windowDays,customRange){
   else if(pct<-15&&slope<0){label="Cortando";cls="b-down"}
   return{pct,delta,slope,label,cls,serie,primeiro,ultimo};
 }
+function shiftDateKey(dateKey,days){
+  const date=new Date(dateKey+"T00:00:00Z");
+  date.setUTCDate(date.getUTCDate()+days);
+  return date.toISOString().slice(0,10);
+}
+function computeScoreAndFase(pagName){
+  const at=ultima[pagName]?.ads;
+  if(at===0||at===null||at===undefined)return{score:0,fase:"💀 INATIVO",label:"Morto",velocidadeAtual:0,aceleracao:0};
+
+  const serieCompleta=datas
+    .map(dk=>({data:dk,valor:pags[pagName]?.[dk]?med(pags[pagName][dk]):null}))
+    .filter(point=>point.valor!==null);
+  const ultimoDia=datas[datas.length-1]||new Date().toISOString().slice(0,10);
+  let inicioAtual,fimAtual,inicioAnterior,fimAnterior;
+  const customStartMs=Date.parse((pagCustom?.start||"")+"T00:00:00Z");
+  const customEndMs=Date.parse((pagCustom?.end||"")+"T00:00:00Z");
+  if(pagWindowCustom&&pagCustom&&Number.isFinite(customStartMs)&&Number.isFinite(customEndMs)&&pagCustom.start<=pagCustom.end){
+    inicioAtual=pagCustom.start;
+    fimAtual=pagCustom.end;
+    const diasJanela=Math.max(1,Math.round((Date.parse(fimAtual+"T00:00:00Z")-Date.parse(inicioAtual+"T00:00:00Z"))/86400000)+1);
+    fimAnterior=shiftDateKey(inicioAtual,-1);
+    inicioAnterior=shiftDateKey(inicioAtual,-diasJanela);
+  }else{
+    const diasJanela=Math.max(1,Number(pagWindow)||3);
+    fimAtual=ultimoDia;
+    inicioAtual=shiftDateKey(fimAtual,-(diasJanela-1));
+    fimAnterior=shiftDateKey(inicioAtual,-1);
+    inicioAnterior=shiftDateKey(inicioAtual,-diasJanela);
+  }
+
+  const atual=serieCompleta.filter(point=>point.data>=inicioAtual&&point.data<=fimAtual);
+  const anterior=serieCompleta.filter(point=>point.data>=inicioAnterior&&point.data<=fimAnterior);
+  const velocidadeAtual=slope(atual.map(point=>point.data),atual.map(point=>point.valor));
+  const velocidadeAnterior=slope(anterior.map(point=>point.data),anterior.map(point=>point.valor));
+  const aceleracao=velocidadeAtual-velocidadeAnterior;
+  const ini=mon[pagName]?.ini||at;
+  const vn=at-ini;
+  let score=0;
+  if(at>=10&&at<=30)score+=35;
+  else if(at<=80)score+=25;
+  else if(at<=150)score+=12;
+  else if(at<=300)score+=3;
+  if(velocidadeAtual>0.5)score+=30;
+  else if(velocidadeAtual>0.1)score+=20;
+  else if(velocidadeAtual>0)score+=8;
+  if(aceleracao>=0&&velocidadeAtual>0)score+=20;
+  else if(aceleracao<0&&velocidadeAtual>0)score+=5;
+  else if(aceleracao>0&&velocidadeAtual<0)score+=8;
+  if(vn>=10&&vn<=150)score+=15;
+  else if(vn>150&&vn<=400)score+=8;
+  score=Math.max(0,Math.min(100,Math.round(score)));
+
+  let fase;
+  if(serieCompleta.length<=4&&at>0&&at<=20)fase="🧪 TESTANDO";
+  else if(velocidadeAtual>0.1&&aceleracao>=-0.05)fase="🚀 ESCALANDO";
+  else if(velocidadeAtual>0.1&&aceleracao< -0.05)fase="⚠️ EM DECLÍNIO";
+  else if(Math.abs(velocidadeAtual)<=0.1)fase="➖ ESTÁVEL";
+  else if(velocidadeAtual< -0.1&&aceleracao<=0)fase="📉 EM QUEDA";
+  else if(velocidadeAtual< -0.1&&aceleracao>0)fase="🔄 QUEDA FREANDO";
+  else fase="➖ ESTÁVEL";
+  return{score,fase,label:fase,velocidadeAtual,aceleracao};
+}
+let scoreSortDirection=-1;
+const scoreByName=new Map();
+if(P==="pag_")LP.forEach(pag=>scoreByName.set(pag,computeScoreAndFase(pag)));
 function windowLabel(){
   return pagWindowCustom?"CUSTOM":pagWindow+"D";
 }
@@ -3859,6 +4089,7 @@ function updateResumoBibliotecas(){
       windowCell.dataset.label=windowLabel();
     }
   });
+  updateScoreCellsAndSort();
   const selector=document.getElementById("pag_window_selector");
   if(!selector)return;
   selector.querySelectorAll(".win-btn").forEach(function(button){
@@ -3906,7 +4137,37 @@ function setupResumoBibliotecas(){
   console.log("[DASHBOARD] seletor janela pag_ pronto, Instagram mantido em bibliotecas");
 }
 
-const porAds=[...LP].sort((a,b)=>(ultima[b]?.ads||0)-(ultima[a]?.ads||0));
+const porAds=[...LP].sort((a,b)=>P==="pag_"
+  ?(scoreByName.get(b)?.score||0)-(scoreByName.get(a)?.score||0)||(ultima[b]?.ads||0)-(ultima[a]?.ads||0)
+  :(ultima[b]?.ads||0)-(ultima[a]?.ads||0));
+function updateScoreCellsAndSort(){
+  if(P!=="pag_")return;
+  const scoreTbody=document.getElementById("pag_tbody");
+  if(!scoreTbody)return;
+  const rows=[...scoreTbody.querySelectorAll("tr")];
+  for(const row of rows){
+    const pagName=row.dataset.pagName;
+    if(!pagName)continue;
+    const result=computeScoreAndFase(pagName);
+    scoreByName.set(pagName,result);
+    const cell=row.querySelector("[data-role='pag-score']");
+    if(cell){
+      const badgeClass=result.score>=85?"b-hot":result.score>=60?"b-up":"b-flat";
+      const title="Velocidade: "+result.velocidadeAtual.toFixed(2)+"/dia | Aceleração: "+result.aceleracao.toFixed(2);
+      cell.innerHTML='<span class="badge '+badgeClass+'" title="'+escapeAttr(title)+'">'+result.score+' '+result.fase+'</span>';
+      cell.dataset.scoreValue=String(result.score);
+    }
+  }
+  rows.sort((a,b)=>{
+    const scoreA=Number(a.querySelector("[data-role='pag-score']")?.dataset.scoreValue)||0;
+    const scoreB=Number(b.querySelector("[data-role='pag-score']")?.dataset.scoreValue)||0;
+    return (scoreA-scoreB)*scoreSortDirection;
+  });
+  rows.forEach((row,index)=>{
+    row.cells[0].textContent=String(index+1);
+    scoreTbody.appendChild(row);
+  });
+}
 const maxAds=ultima[porAds[0]]?.ads||1;
 const MAX_PINNED=4;
 const storageKey="viva_dashboard_pinned_"+P.replace(/_$/g,"");
@@ -4131,16 +4392,23 @@ porAds.forEach((pag,idx)=>{
 
   const tr=document.createElement("tr");
   if(P==="pag_")tr.dataset.pagName=pag;
-  const checkAt=ultima[pag]?.tentativa||ultima[pag]?.ultimaColeta;
-  const checkStatus=ultima[pag]?.status;
+  const checkAt=ultima[pag]?.ultimaColeta;
+  const tentativa=ultima[pag]?.tentativa;
+  const checkStatus=tentativa?.status;
   const checkLabels={em_andamento:"em andamento",falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
-  const checkStatusHtml=checkStatus&&checkStatus!=="ok"&&checkStatus!=="ok_zero"
-    ?'<div style="color:'+(checkStatus==="em_andamento"?"#fbbf24":"#fb7185")+';font-size:10px" title="'+escapeAttr(ultima[pag]?.erro||"")+'">'+(checkLabels[checkStatus]||"falhou")+'</div>'
+  const checkStatusHtml=tentativa?.relevante&&checkStatus
+    ?'<div style="color:#fb7185;font-size:10px" title="'+escapeAttr(tentativa.error||"")+'">'+(checkLabels[checkStatus]||"falhou")+'</div>'
     :'';
   tr.dataset.search=(pag+" "+(ultima[pag]?.url||"")+" "+(m.geo||"")+" "+(m.nicho||"")).toLowerCase();
   const trendCell=P==="pag_"
     ?'<td data-label="Tendência" data-role="pag-window-trend">'+windowTrendHtml(pagWindowStats)+'</td>'
     :'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>';
+  const scoreData=P==="pag_"?scoreByName.get(pag):null;
+  const scoreBadgeClass=scoreData?(scoreData.score>=85?"b-hot":scoreData.score>=60?"b-up":"b-flat"):"";
+  const scoreTitle=scoreData?"Velocidade: "+scoreData.velocidadeAtual.toFixed(2)+"/dia | Aceleração: "+scoreData.aceleracao.toFixed(2):"";
+  const scoreCell=scoreData
+    ?'<td data-label="SCORE" data-role="pag-score" data-score-value="'+scoreData.score+'"><span class="badge '+scoreBadgeClass+'" title="'+escapeAttr(scoreTitle)+'">'+scoreData.score+' '+scoreData.fase+'</span></td>'
+    :'';
   const windowCell=P==="pag_"
     ?'<td class="spark3" data-label="'+windowLabel()+'" data-role="pag-window-value">'+windowValueHtml(pagWindowStats)+'</td>'
     :'<td class="spark3" data-label="3 dias">'+spark3+'</td>';
@@ -4157,6 +4425,7 @@ porAds.forEach((pag,idx)=>{
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +trendCell
+    +scoreCell
     +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
     +windowCell
     +instagramCell;
@@ -4168,6 +4437,22 @@ porAds.forEach((pag,idx)=>{
   tr.querySelector(".hist-pin-cell").appendChild(pinButton);
   tbody.appendChild(tr);
 });
+if(P==="pag_"){
+  const scoreHeader=document.getElementById("pag_th_score");
+  if(scoreHeader){
+    scoreHeader.addEventListener("click",function(){
+      scoreSortDirection*=-1;
+      scoreHeader.setAttribute("aria-sort",scoreSortDirection===-1?"descending":"ascending");
+      updateScoreCellsAndSort();
+    });
+    scoreHeader.addEventListener("keydown",function(event){
+      if(event.key==="Enter"||event.key===" "){
+        event.preventDefault();
+        scoreHeader.click();
+      }
+    });
+  }
+}
 atualizarBotoesFixacao();
 if(P==="pag_"){
   setupResumoBibliotecas();
@@ -4696,22 +4981,22 @@ async function refreshLastChecks(){
     if(!response.ok)throw new Error("Falha ao consultar últimas checagens");
     const checks=await response.json();
     const cells=new Map([...document.querySelectorAll(".last-check-cell")].map(cell=>[cell.dataset.slug,cell]));
-    const labels={em_andamento:"em andamento",falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
+    const labels={falha_timeout:"timeout/rede",falha_bloqueio:"bloqueio da Meta",falha_parse:"contador não lido",falha_url_invalida:"URL inválida",falha_gravacao:"falha ao salvar",falha_execucao:"execução interrompida"};
     for(const check of checks){
       const cell=cells.get(check.slug);
       if(!cell)continue;
       cell.replaceChildren();
-      if(check.checked_at){
-        cell.append(document.createTextNode(new Date(check.checked_at).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})));
+      if(check.ultima_coleta_ok){
+        cell.append(document.createTextNode(new Date(check.ultima_coleta_ok).toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})));
       }else{
         cell.append(document.createTextNode("—"));
       }
-      if(check.status&&check.status!=="ok"&&check.status!=="ok_zero"){
+      if(check.tentativa?.relevante&&check.tentativa?.status){
         const state=document.createElement("div");
-        state.style.color=check.status==="em_andamento"?"#fbbf24":"#fb7185";
+        state.style.color="#fb7185";
         state.style.fontSize="10px";
-        state.textContent=labels[check.status]||"falhou";
-        if(check.error)state.title=check.error;
+        state.textContent=labels[check.tentativa.status]||"falhou";
+        if(check.tentativa.error)state.title=check.tentativa.error;
         cell.appendChild(state);
       }
     }
